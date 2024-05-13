@@ -1,11 +1,8 @@
 import logging
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s", level=logging.INFO
-)
 
-from supervisor import Context, Host, Process, ProcessExited, HostDisconnected, TTL
-from typing import List, Dict, Any, Set
+from supervisor import Host, Process, ProcessExited, HostDisconnected, TTL
+from typing import List, Any, Set
 import sys
 import signal
 from supervisor import get_message_queue
@@ -14,6 +11,10 @@ import os
 import itertools
 import time
 from typing import NamedTuple
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s", level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 
@@ -30,7 +31,7 @@ def start_training(
 
     logger.info(f"starting health checks host {len(hosts)} hosts")
     env = {"ATTEMPT": str(attempt)}
-    pg: List[Process] = ctx.create_process_group(
+    _pg: List[Process] = ctx.create_process_group(
         hosts,
         args=[sys.executable, __file__, "--health", sys.argv[2]],
         env=env,

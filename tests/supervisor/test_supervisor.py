@@ -1,5 +1,4 @@
-from io import SEEK_CUR
-from typing_extensions import Required
+from weakref import WeakKeyDictionary
 import unittest
 
 try:
@@ -7,8 +6,8 @@ try:
 except ImportError:
     raise unittest.SkipTest("zmq not installed in test harness")
 from supervisor import (Context, HostConnected, HostDisconnected, ProcessStarted,
-                       ProcessFailedToStart, get_message_queue, ProcessExited,
-                       FunctionCall)
+                        ProcessFailedToStart, get_message_queue, ProcessExited,
+                        FunctionCall, TTL)
 from supervisor.launchers import mast
 from unittest.mock import patch, Mock
 from contextlib import contextmanager
@@ -27,7 +26,6 @@ from pathlib import Path
 import sys
 import socket
 from collections import deque
-from typing import NamedTuple
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s", level=logging.INFO
@@ -36,11 +34,9 @@ logging.basicConfig(
 
 @contextmanager
 def context(*args, **kwargs):
-    try:
-        ctx = Context(*args, **kwargs)
-        yield ctx
-    finally:
-        ctx.shutdown()
+    ctx = Context(*args, **kwargs)
+    yield ctx
+    ctx.shutdown()
 
 
 @contextmanager
@@ -402,6 +398,28 @@ class SupervisorUnitTests(unittest.TestCase):
             socket0.send_pyobj(("_started", 2, "Failed"))
 
             self.assertTrue(isinstance(exit_messages.recv(timeout=1).message.result, ProcessFailedToStart) )
+
+    def test_proc_deletion(self):
+        with context() as ctx, host_sockets(1) as (socket,):
+            h0, = ctx.request_hosts(1)
+            socket.send_pyobj(("_hostname", None, "host0"))
+            self.assertEqual(socket.recv(), b"")
+            pgs_weak = WeakKeyDictionary()
+            for i in range(1):
+                pgs = ctx.create_process_group([h0,], args=["test"], processes_per_host=1000)
+                for pg in pgs:
+                    pgs_weak[pg] = True
+                del pgs
+                del pg
+                assert len(pgs_weak) == 1000
+                for i in range(1000):
+                    _launch, id, *rest = socket.recv_pyobj()
+                    socket.send_pyobj(("_started", id, id))
+                    socket.send_pyobj(("_exited", id, 0))
+                ttl = TTL(1)
+                while ctx.recvready(ttl()):
+                    pass
+                assert len(pgs_weak) == 0
 
     def test_log_redirect(self):
         m = Mock()

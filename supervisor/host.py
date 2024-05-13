@@ -12,7 +12,7 @@ import time
 import traceback
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional
+from typing import Callable, Dict, List, Mapping, Optional, Any
 from random import random
 import zmq
 from supervisor import HEARTBEAT_INTERVAL, HEARTBEAT_LIVENESS, ProcessFailedToStart
@@ -47,14 +47,13 @@ class Process:
         rank: int,
         processes_per_host: int,
         world_size: int,
-        popen: Mapping[str, object],
+        popen: Mapping[str, Any],
         proc_addr: str,
     ) -> None:
         self.proc_id = proc_id
         self.proc_comm = proc_comm
         environ = dict(os.environ)
         if popen["env"] is not None:
-            # pyre-ignore
             environ.update(popen["env"])
         environ["RANK"] = str(rank)
         environ["WORLD_SIZE"] = str(world_size)
@@ -139,7 +138,6 @@ class Host:
         self.has_shutdown = False
         self.exits: List[bytes] = []
 
-
     def heartbeat(self) -> None:
         self.supervisor_comm.send(b"")
 
@@ -192,7 +190,7 @@ class Host:
             self.exits.append(pickle.dumps(("_exited", process.proc_id, returncode)))
 
     def on_subprocess_exit(
-        self, subprocess: subprocess.Popen, on_exit: Callable[[], None]
+        self, subprocess: subprocess.Popen, on_exit: Callable[[], Any]
     ) -> None:
         fd: int = pidfd_open(subprocess.pid)
         self.fd_to_on_exit[fd] = on_exit
@@ -248,6 +246,7 @@ class Host:
     def run_event_loop_forever(self) -> None:
         log_pstree_info_at = time.time() + LOG_PSTREE_INTERVAL
         expiry = None
+        heartbeat_at = 0
         while True:
             timeout = (
                 None

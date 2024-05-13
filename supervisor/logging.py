@@ -1,7 +1,6 @@
 import logging
 import socket
 import sys
-import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +41,7 @@ class _Formatter(logging.Formatter):
             f"{record.pathname}:"
             f"{record.lineno}]{self.suffix}"
         )
-        return "\n".join(f"{prefix} {l}" for l in lines)
+        return "\n".join(f"{prefix} {line}" for line in lines)
 
 
 def initialize_logging(process_name=None):

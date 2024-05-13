@@ -1,25 +1,10 @@
 # only in itertools after 3.12
-from supervisor import Context, Host, Process, ProcessStarted, ProcessExited, get_message_queue
-from typing import Iterator, List, TypeVar, Sequence, Dict
+from supervisor import Host, ProcessStarted, ProcessExited, get_message_queue
+from typing import TypeVar, Sequence
 import sys
 import zmq
-from itertools import repeat
-import pickle
-import io
 
 T = TypeVar("T")
-
-
-def batched(xs: Sequence[T], n: int) -> Iterator[List[T]]:
-    b = []
-    for x in xs:
-        b.append(x)
-        if len(b) == n:
-            yield b
-            b = []
-    if b:
-        yield b
-
 
 def mapreduce(
     hosts: Sequence[Host],
@@ -72,7 +57,7 @@ def mapreduce(
                 proc.send(("finish", None))
                 break
             dst = f"tcp://{proc.host.hostname}:{port}"
-            for src, port in tail:
+            for src, _port in tail:
                 src.send(("send", dst))
                 active.remove(src)
             proc.send(("reduce", len(tail)))
@@ -94,7 +79,9 @@ def main():
     name = "tcp://*:*"
     router = _socket(q._ctx)
     router.bind(name)
-    port = router.getsockopt(zmq.LAST_ENDPOINT).decode().split(":")[-1]
+    endpoint = router.getsockopt(zmq.LAST_ENDPOINT)
+    assert isinstance(endpoint, bytes)
+    port: str = endpoint.decode().split(":")[-1]
     r = map(inputs)
     # print(f"{port}: r = reduce(map({inputs})")
     q.send(port)

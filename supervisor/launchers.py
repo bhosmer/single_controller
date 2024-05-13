@@ -1,14 +1,13 @@
 import io
 import json
 import logging
-import math
 import os
 import socket
 import subprocess
 import sys
 import time
 import traceback
-from typing import Callable
+from typing import Callable, Tuple, Sequence
 import signal
 
 from .host import main
@@ -42,7 +41,7 @@ def _write_reply_file(msg, reply_file=None):
         json.dump(error_data, reply_file)
 
 
-def mast(supervise: Callable[[int, int], None]):
+def mast(supervise: Callable[[Context, Sequence[Host]], None]):
     """
     This function is the entrypoint for starting the supervisor when
     running on MAST. Each host should call `mast(supervise)` where
@@ -86,15 +85,15 @@ def mast(supervise: Callable[[int, int], None]):
         )
         try:
             ctx = Context(port=PORT)
-            hosts: List[Host] = ctx.request_hosts(n=N)
+            hosts: Tuple[Host, ...] = ctx.request_hosts(n=N)
             supervise(ctx, hosts)
             ctx.shutdown()
             logger.info("Supervisor shutdown complete.")
-        except:
+        except BaseException:
             ty, e, st = sys.exc_info()
             s = io.StringIO()
             traceback.print_tb(st, file=s)
-            _write_reply_file(f"{ty.__name__}: {str(e)}\n{s.getvalue()}")
+            _write_reply_file(f"{ty.__name__ if ty is not None else 'None'}: {str(e)}\n{s.getvalue()}")
             host_process.send_signal(signal.SIGINT)
             raise
         return_code = host_process.wait(timeout=10)

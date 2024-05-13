@@ -6,7 +6,6 @@ import signal
 import sys
 import time
 import weakref
-import importlib.util
 from functools import cache
 from collections import deque
 from enum import Enum
@@ -25,6 +24,7 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
+    Any
 )
 
 import zmq
@@ -73,7 +73,7 @@ class Connection:
             # let the connection know we exist
             ctx._backend.send_multipart([name, b""])
 
-    def heartbeat(self) -> None:
+    def heartbeat(self) -> float:
         now = time.time()
         ttl = self.expiry - now
         self.expiry = now + HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
@@ -123,7 +123,7 @@ class Connection:
             # no longer has a handle to the Process object
             # in which case they are ok to just drop
             assert proc_id >= 0 and proc_id < ctx._next_id, "unexpected proc_id"
-            logger.debug(
+            logger.warning(
                 "Received message %s from process %s after local handle deleted",
                 cmd,
                 proc_id,
@@ -157,9 +157,7 @@ class Host:
         self._state: _State = _UNATTACHED
         self._name: Optional[bytes] = None
         self._deferred_sends: List[bytes] = []
-        self._proc_table: weakref.WeakValueDictionary[
-            int, Process
-        ] = weakref.WeakValueDictionary()
+        self._proc_table: Dict[int, Process] = {}
         self._hostname: Optional[str] = None
         self._is_lost = False
 
@@ -176,13 +174,14 @@ class Host:
             return
         self._state = _LOST
         if orig_state is _ATTACHED:
+            assert self._name is not None
             self._context._name_to_connection[self._name].lost(self._context, msg)
         self._name = None
         self._deferred_sends.clear()
-        for p in self._proc_table.values():
+        for p in list(self._proc_table.values()):
             p._lost_host()
-        # is there value in keeping this around for a reconnect?
-        self._proc_table.clear()
+        # should be cleared by aborting the processes
+        assert len(self._proc_table) == 0
         self._context._produce_message(self, HostDisconnected(time.time()))
         self._is_lost = True
 
@@ -193,11 +192,11 @@ class Host:
             self._deferred_sends.append(msg)
 
     def _launch(self, p: "Process") -> None:
+        self._proc_table[p._id] = p
         if self._state is _LOST:
             # launch after we lost connection to this host.
             p._lost_host()
             return
-        self._proc_table[p._id] = p
         self._send(
             pickle.dumps(
                 (
@@ -288,9 +287,9 @@ class Process:
     def _lost_host(self) -> None:
         self._abort(ConnectionAbortedError("Lost connection to process host"))
 
-    def _abort(self, e: BaseException) -> None:
+    def _abort(self, e: Exception) -> None:
         if self._state in ["launched", "running"]:
-            self._context._produce_message(self, ProcessExited(e))
+            self._exit_message(e)
         self._state = "aborted"
 
     def send(self, msg: object) -> None:
@@ -311,8 +310,12 @@ class Process:
     def _exited(self, returncode: int) -> None:
         self._state = "exited"
         self._returncode = returncode
-        self._context._produce_message(self, ProcessExited(returncode))
+        self._exit_message(returncode)
         self._context._exits += 1
+
+    def _exit_message(self, returncode: Union[int, Exception]) -> None:
+        self.host._proc_table.pop(self._id)
+        self._context._produce_message(self, ProcessExited(returncode))
 
     def _started(self, pid: Union[str, int]) -> None:
         if isinstance(pid, int):
@@ -351,8 +354,8 @@ class Status(NamedTuple):
     process_deletes: int
     unassigned_hosts: int
     unassigned_connections: int
-    poll_percentage: int
-    active_percentage: int
+    poll_percentage: float
+    active_percentage: float
     heartbeats: int
     heartbeat_average_ttl: float
     heartbeat_min_ttl: float
@@ -558,6 +561,7 @@ class Context(FilteredMessageQueue):
                 self._unassigned_hosts.popleft()
                 c.host = h
                 h._name = c.name
+                assert c.hostname is not None
                 h._context._produce_message(h, HostConnected(c.hostname))
                 h._hostname = c.hostname
                 h._state = c.state = _ATTACHED
@@ -645,7 +649,10 @@ class Context(FilteredMessageQueue):
         self._reset_heartbeat_stats()
 
         logger.info(
-            "supervisor status: %s process launches, %s starts, %s exits, %s message sends, %s message responses, %s process __del__, %s hosts waiting for connections, %s connections waiting for handles, time is %.2f%% polling and %.2f%% active, heartbeats %s, heartbeat_avg_ttl %.4f, heartbeat_min_ttl %.4f, connections %s",
+            "supervisor status: %s process launches, %s starts, %s exits, %s message sends, %s message responses,"
+            " %s process __del__, %s hosts waiting for connections, %s connections waiting for handles,"
+            " time is %.2f%% polling and %.2f%% active, heartbeats %s, heartbeat_avg_ttl %.4f,"
+            " heartbeat_min_ttl %.4f, connections %s",
             *status,
         )
         self.log_status(status)
@@ -748,10 +755,8 @@ class Context(FilteredMessageQueue):
             processes_per_host,
         )
         popen = {"args": args, "env": env, "cwd": cwd}
-        send_call = False
         if isinstance(args, _FunctionCall):
             popen["args"] = [sys.executable, '-m', 'supervisor.function_call']
-            send_call = True
         procs = tuple(
             Process(
                 self,
@@ -766,10 +771,10 @@ class Context(FilteredMessageQueue):
             for i, h in enumerate(hosts)
             for j in range(processes_per_host)
         )
-        self._schedule(lambda: self._launch_processes(procs, message=args if send_call else None))
+        self._schedule(lambda: self._launch_processes(procs, message=args if isinstance(args, _FunctionCall) else None))
         return procs
 
-    def _launch_processes(self, procs: Sequence[Process], message=Optional['_FunctionCall']) -> None:
+    def _launch_processes(self, procs: Sequence[Process], message: Optional['_FunctionCall']) -> None:
         for p in procs:
             p.host._launch(p)
             if message is not None:
@@ -788,7 +793,7 @@ class Context(FilteredMessageQueue):
 @cache
 def get_message_queue(
     supervisor_ident: Optional[int] = None, supervisor_pipe: Optional[str] = None
-) -> zmq.Socket:
+) -> 'LocalMessageQueue':
     """
     Processes launched on the hosts can use this function to connect
     to the messaging queue of the supervisor.
@@ -821,7 +826,7 @@ class LocalMessageQueue(FilteredMessageQueue):
             return []
         return [Letter(None, self._sock.recv_pyobj())]
 
-    def send(self, message: NamedTuple) -> None:
+    def send(self, message: Any) -> None:
         self._sock.send_pyobj(message)
 
     def close(self):
@@ -836,7 +841,7 @@ class _FunctionCall(NamedTuple):
 def FunctionCall(target, *args, **kwargs):
     if target.startswith('__main__.'):
         file = sys.modules['__main__'].__file__
-        sys.modules['__entry__']  = sys.modules['__main__']
+        sys.modules['__entry__'] = sys.modules['__main__']
         target = f'{file}:{target.split(".", 1)[1]}'
     return _FunctionCall(target, args, kwargs)
 
@@ -873,7 +878,8 @@ def FunctionCall(target, *args, **kwargs):
 #   This creates another socket on the 'bind' side (three total sockets). Bind and listen
 #   must happen before 'connect' or the connection will be refused. In zeromq, any socket can
 #   bind or connect. A socket that binds can be connected to many others if multiple other sockets connect to it.
-#   A socket can also connect itself to multiple other sockets by calling connect multiple times (we do not use this here).
+#   A socket can also connect itself to multiple other sockets by calling connect multiple times
+#   (we do not use this here).
 #   Connect can come before bind, zeromq will retry if the bind-ing process is not yet there.
 # * When sockets are connected to multiple others, we have to define what it means to send
 #   or receive. This is configured when creating a socket. zmq.PAIR asserts there will only
