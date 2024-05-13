@@ -5,7 +5,6 @@ import pickle
 import signal
 import sys
 import time
-import weakref
 from functools import cache
 from collections import deque
 from enum import Enum
@@ -364,7 +363,7 @@ class Status(NamedTuple):
 
 class Letter(NamedTuple):
     sender: Union[Host, Process, None]
-    message: NamedTuple
+    message: Any
 
 
 class HostConnected(NamedTuple):

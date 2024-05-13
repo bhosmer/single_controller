@@ -1,8 +1,8 @@
 import logging
 
 
-from supervisor import Host, Process, ProcessExited, HostDisconnected, TTL
-from typing import List, Any, Set
+from supervisor import Host, ProcessExited, HostDisconnected, TTL
+from typing import Any, Set
 import sys
 import signal
 from supervisor import get_message_queue
@@ -31,7 +31,7 @@ def start_training(
 
     logger.info(f"starting health checks host {len(hosts)} hosts")
     env = {"ATTEMPT": str(attempt)}
-    _pg: List[Process] = ctx.create_process_group(
+    ctx.create_process_group(
         hosts,
         args=[sys.executable, __file__, "--health", sys.argv[2]],
         env=env,
@@ -102,7 +102,7 @@ def supervise(ctx, host_list):
         if wait_for_exit(ctx, process_group, hosts):
             break
         logger.info("Training has failed, attempting restart...")
-    logger.info(f"Training exited successfully.")
+    logger.info("Training exited successfully.")
 
 
 def train():

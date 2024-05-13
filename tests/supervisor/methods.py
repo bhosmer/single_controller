@@ -14,7 +14,9 @@ def reply_hello(a, b, x):
 class Mapper:
     def map(self, items):
         return sum(x*2 for x in items)
+
     def reduce(self, items):
         return sum(items)
+
     def finish(self, result):
         return result

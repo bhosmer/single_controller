@@ -7,7 +7,7 @@ except ImportError:
     raise unittest.SkipTest("zmq not installed in test harness")
 from supervisor import (Context, HostConnected, HostDisconnected, ProcessStarted,
                         ProcessFailedToStart, get_message_queue, ProcessExited,
-                        FunctionCall, TTL)
+                        FunctionCall)
 from supervisor.launchers import mast
 from unittest.mock import patch, Mock
 from contextlib import contextmanager
@@ -26,6 +26,7 @@ from pathlib import Path
 import sys
 import socket
 from collections import deque
+from tests.supervisor.methods import Reply, Mapper
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s", level=logging.INFO
@@ -74,7 +75,7 @@ def mock_process_handling():
             killpg(self.pid, sig)
 
         def wait(self):
-            return self.returncode
+            return getattr(self, 'returncode', None)
 
     def mock_pidfdopen(pid):
         with lock:
@@ -92,7 +93,7 @@ def connected_host():
     backend = context.socket(zmq.ROUTER)
     backend.setsockopt(zmq.IPV6, True)
     backend.bind("tcp://*:55555")
-    exited = None
+    exited: Exception = Exception()
     host = supervisor.host.Host("tcp://127.0.0.1:55555")
 
     def run_host():
@@ -102,7 +103,7 @@ def connected_host():
         except ConnectionAbortedError as e:
             exited = e
         except SystemExit:
-            exited = True
+            pass
 
     thread = threading.Thread(target=run_host, daemon=True)
     thread.start()
@@ -115,7 +116,7 @@ def connected_host():
         if thread.is_alive():
             raise RuntimeError("thread did not terminate")
     host.context.destroy(linger=500)
-    if exited != True:
+    if isinstance(exited, ConnectionAbortedError):
         raise exited
 
 
@@ -177,11 +178,13 @@ class SupervisorUnitTests(unittest.TestCase):
                 rank=0,
                 processes_per_rank=1,
                 world_size=1,
-                popen={"env": None},
+                popen=None,
                 name="fake",
                 simulate=False,
                 log_file=None,
             ):
+                if popen is None:
+                    popen = {"env": None}
                 msg = (
                     "launch",
                     proc_id,
@@ -238,21 +241,18 @@ class SupervisorUnitTests(unittest.TestCase):
         # test double shutodwn
         host.shutdown()
 
-        with self.assertRaises(ConnectionAbortedError):
-            with connected_host() as (socket, _):
-                f, msg = socket.recv_multipart()
-                socket.send_multipart([f, pickle.dumps(("abort", "An error"))])
+        with self.assertRaises(ConnectionAbortedError), connected_host() as (socket, _):
+            f, msg = socket.recv_multipart()
+            socket.send_multipart([f, pickle.dumps(("abort", "An error"))])
 
     def test_host_timeout_and_heartbeat(self):
-        with self.assertRaises(ConnectionAbortedError):
-            with patch.object(
-                supervisor.host, "HEARTBEAT_INTERVAL", 0.01
-            ), connected_host() as (socket, host):
-                f, msg = socket.recv_multipart()
-                socket.send_multipart([f, b""])
-                time.sleep(0.1)
-                f, msg = socket.recv_multipart()
-                self.assertEqual(msg, b"")
+        with self.assertRaises(ConnectionAbortedError), \
+             patch.object(supervisor.host, "HEARTBEAT_INTERVAL", 0.01), connected_host() as (socket, host):
+            f, msg = socket.recv_multipart()
+            socket.send_multipart([f, b""])
+            time.sleep(0.1)
+            f, msg = socket.recv_multipart()
+            self.assertEqual(msg, b"")
 
     def test_supervisor_api(self):
         with context() as ctx:
@@ -286,10 +286,12 @@ class SupervisorUnitTests(unittest.TestCase):
                 self.assertEqual(pm.recv(timeout=1).message, "world")
                 self.assertEqual(ctx.recv(timeout=1).message, "nope")
                 ctx.return_hosts([h0])
-                self.assertTrue(isinstance(ctx.messagefilter(ProcessExited).recv(timeout=1).message.result, ConnectionAbortedError))
+                self.assertTrue(isinstance(ctx.messagefilter(ProcessExited).recv(timeout=1).message.result,
+                                           ConnectionAbortedError))
                 self.assertTrue(ctx.messagefilter(HostDisconnected).recv(timeout=1).sender is h0)
                 (p,) = ctx.create_process_group([h0], args=["test3"])
-                self.assertTrue(isinstance(ctx.messagefilter(ProcessExited).recv(timeout=1).message.result, ConnectionAbortedError))
+                self.assertTrue(isinstance(ctx.messagefilter(ProcessExited).recv(timeout=1).message.result,
+                                           ConnectionAbortedError))
 
             with host_sockets(1) as (socket,):
                 socket.send_pyobj(("_hostname", None, "host1"))
@@ -324,33 +326,33 @@ class SupervisorUnitTests(unittest.TestCase):
                 self.assertEqual(ctx.recv(timeout=1).message.hostname, "host0")
 
     def test_bad_host_managers(self):
-        with context() as ctx:
-            with host_sockets(5) as (socket0, socket1, socket2, socket3, socket4):
-                socket0.send(b"somegarbage")
-                self.assertEqual(
-                    socket0.recv_pyobj(),
-                    ("abort", "Connection did not start with a hostname"),
-                )
-                socket1.send_pyobj(("_hostname", None, 7))
-                self.assertEqual(
-                    socket1.recv_pyobj(),
-                    ("abort", "Connection did not start with a hostname"),
-                )
-                socket2.send_pyobj(("_hostname", None, "host0"))
-                self.assertEqual(socket2.recv(), b"")
-                socket2.send_pyobj(("_started", 0, 7))
-                self.assertEqual(
-                    socket2.recv_pyobj(),
-                    ("abort", "Host manager sent messages before attached."),
-                )
-                (h,) = ctx.request_hosts(1)
-                socket3.send_pyobj(("_hostname", None, "host3"))
-                self.assertEqual(ctx.recv(1).sender.hostname, "host3")
-                socket4.send(b"")
-                self.assertEqual(
-                    socket4.recv_pyobj(),
-                    ("abort", "Connection did not start with a hostname"),
-                )
+        with context() as ctx, host_sockets(5) as (socket0, socket1, socket2, socket3, socket4):
+            socket0.send(b"somegarbage")
+            self.assertEqual(
+                socket0.recv_pyobj(),
+                ("abort", "Connection did not start with a hostname"),
+            )
+            socket1.send_pyobj(("_hostname", None, 7))
+            self.assertEqual(
+                socket1.recv_pyobj(),
+                ("abort", "Connection did not start with a hostname"),
+            )
+            socket2.send_pyobj(("_hostname", None, "host0"))
+            self.assertEqual(socket2.recv(), b"")
+            socket2.send_pyobj(("_started", 0, 7))
+            self.assertEqual(
+                socket2.recv_pyobj(),
+                ("abort", "Host manager sent messages before attached."),
+            )
+            (h,) = ctx.request_hosts(1)
+            socket3.send_pyobj(("_hostname", None, "host3"))
+
+            self.assertEqual(ctx.recv(1).sender.hostname, "host3")  # type: ignore
+            socket4.send(b"")
+            self.assertEqual(
+                socket4.recv_pyobj(),
+                ("abort", "Connection did not start with a hostname"),
+            )
 
     def test_host_manager_no_heartbeat(self):
         with patch.object(
@@ -378,7 +380,7 @@ class SupervisorUnitTests(unittest.TestCase):
             pg = ctx.create_process_group([h0, h1], args=["test"], processes_per_host=3)
             self.assertEqual(len(pg), 6)
             pg[0].signal(signal.SIGTERM)
-            for i in range(3):
+            for _i in range(3):
                 socket0.recv_pyobj()  # launches
             self.assertEqual(socket0.recv_pyobj(), ("signal", 0, signal.SIGTERM, True))
             socket0.send_pyobj(("_response", 0, pickle.dumps("hello")))
@@ -397,28 +399,28 @@ class SupervisorUnitTests(unittest.TestCase):
             self.assertTrue(exited.sender is pg[1])
             socket0.send_pyobj(("_started", 2, "Failed"))
 
-            self.assertTrue(isinstance(exit_messages.recv(timeout=1).message.result, ProcessFailedToStart) )
+            self.assertTrue(isinstance(exit_messages.recv(timeout=1).message.result, ProcessFailedToStart))
 
     def test_proc_deletion(self):
         with context() as ctx, host_sockets(1) as (socket,):
             h0, = ctx.request_hosts(1)
             socket.send_pyobj(("_hostname", None, "host0"))
+            ctx.recv()
             self.assertEqual(socket.recv(), b"")
             pgs_weak = WeakKeyDictionary()
-            for i in range(1):
+            for _i in range(3):
                 pgs = ctx.create_process_group([h0,], args=["test"], processes_per_host=1000)
                 for pg in pgs:
                     pgs_weak[pg] = True
                 del pgs
-                del pg
+                pg = None
                 assert len(pgs_weak) == 1000
-                for i in range(1000):
+                for _i in range(1000):
                     _launch, id, *rest = socket.recv_pyobj()
                     socket.send_pyobj(("_started", id, id))
                     socket.send_pyobj(("_exited", id, 0))
-                ttl = TTL(1)
-                while ctx.recvready(ttl()):
-                    pass
+                for _ in range(2*1000):
+                    ctx.recv()
                 assert len(pgs_weak) == 0
 
     def test_log_redirect(self):
@@ -442,7 +444,7 @@ class SupervisorUnitTests(unittest.TestCase):
     def test_host_replace(self):
         with context() as ctx:
             b = ctx.request_hosts(2)
-            nh = ctx.replace_hosts(x for x in b)
+            nh = ctx.replace_hosts(b)
             self.assertEqual(len(b), len(nh))
 
     def test_pstree(self):
@@ -534,8 +536,6 @@ class SupervisorUnitTests(unittest.TestCase):
             self.assertEqual(11, ctx.recv())
 
 
-
-
 @contextmanager
 def mock_messages(messages):
     orig_bind = zmq.Socket.bind
@@ -599,8 +599,8 @@ class SupervisorIntegrationTests(unittest.TestCase):
         train,
         expect,
         N=4,
-        run_fraction=1,
-        rank_fraction=1,
+        run_fraction: float = 1,
+        rank_fraction: float = 1,
         connections=4,
     ):
         test_name = Path(__file__).parent / "supervisor_integration.py"
@@ -672,38 +672,33 @@ class SupervisorIntegrationTests(unittest.TestCase):
         self.check_supervisor_function("map_reduce")
 
 
-from tests.supervisor.methods import Reply, Mapper
-
 def function_call_process(ctx, hosts):
     host_connected = ctx.messagefilter(HostConnected)
-    for h in hosts:
+    for _ in hosts:
         host_connected.recv(timeout=1)
-    proc = hosts[0].create_process(FunctionCall(f'tests.supervisor.methods.reply_hello', 3, 4, x=5))
+    hosts[0].create_process(FunctionCall('tests.supervisor.methods.reply_hello', 3, 4, x=5))
     r = ctx.messagefilter(Reply).recv(timeout=1)
     assert r.message == Reply(3, 4, x=5)
 
 def function_call_process_module(ctx, hosts):
-    for h in hosts:
-        ctx.recv(timeout=1) # connected
-    proc = hosts[0].create_process(FunctionCall('builtins.print', "hello, world"))
+    for _ in hosts:
+        ctx.recv(timeout=1)  # connected
+    hosts[0].create_process(FunctionCall('builtins.print', "hello, world"))
     m = ctx.recv(timeout=1)
-    print(m)
     assert isinstance(m.message, ProcessStarted)
     assert ctx.recv(timeout=1).message.result == 0
-    proc = hosts[0].create_process(FunctionCall('builtins.this_doesnt_work', "hello, world"))
+    hosts[0].create_process(FunctionCall('builtins.this_doesnt_work', "hello, world"))
     assert isinstance(ctx.recv(timeout=1).message, ProcessStarted)
     m = ctx.recv(timeout=1)
     assert m.message.result != 0
 
 def map_reduce(ctx, hosts):
-    for h in hosts:
-        ctx.recv(timeout=1) # connected
+    for _ in hosts:
+        ctx.recv(timeout=1)  # connected
     from supervisor.mapreduce import mapreduce
     for items, branch in (([*range(17)], 4), ([*range(16)], 2), ([*range(1)], 2)):
         r = mapreduce(hosts, Mapper(), items, branch=branch)
         assert sum(2*i for i in items) == r
-
-
 
 
 if __name__ == "__main__":
