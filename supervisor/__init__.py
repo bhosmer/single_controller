@@ -487,6 +487,17 @@ def TTL(timeout: float):
     expiry = time.time() + timeout
     return lambda: max(expiry - time.time(), 0)
 
+class ProcessList(tuple):
+    def send(self, msg: Any) -> None:
+        for p in self:
+            p.send(msg)
+
+    def __getitem__(self, index):
+        result = super().__getitem__(index)
+        # If the index is a slice, convert the result to MyTuple
+        if isinstance(index, slice):
+            return ProcessList(result)
+        return result
 
 class Context(FilteredMessageQueue):
     def __init__(
@@ -756,7 +767,7 @@ class Context(FilteredMessageQueue):
         popen = {"args": args, "env": env, "cwd": cwd}
         if isinstance(args, _FunctionCall):
             popen["args"] = [sys.executable, '-m', 'supervisor.function_call']
-        procs = tuple(
+        procs = ProcessList(
             Process(
                 self,
                 h,

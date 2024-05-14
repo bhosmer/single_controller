@@ -234,6 +234,11 @@ class Host:
             for proc in self.process_table.values():
                 os.killpg(proc.subprocess.pid, signal.SIGKILL)
 
+
+        self.proc_comm.close(linger=0)
+        self.supervisor_comm.close(linger=0)
+        self.context.term()
+
     def abort(self, with_error: Optional[str] = None) -> None:
         self.shutdown()
         if with_error:

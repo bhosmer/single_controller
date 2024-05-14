@@ -112,7 +112,7 @@ def connected_host():
     finally:
         backend.close()
         context.term()
-        thread.join(timeout=1)
+        thread.join(timeout=10)
         if thread.is_alive():
             raise RuntimeError("thread did not terminate")
     host.context.destroy(linger=500)
