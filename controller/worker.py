@@ -1,13 +1,14 @@
 from supervisor import LocalMessageQueue, ProcessList, get_message_queue, Context, Host
+from supervisor.logging import initialize_logging
 from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple
-from torch import dtype, layout, device, memory_format
 from typing_extensions import Unpack
-import torch
 from contextlib import contextmanager
-from .base_tensor import BaseTensor
 import math
 import os
 import importlib
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Ref(NamedTuple):
     id: int
@@ -42,7 +43,7 @@ class Worker:
         raise RuntimeError(f"unhandled event: {event}")
 
     def CreateDeviceMesh(self, result: Ref, dims: Dict[str, int], ranks: List[int]):
-        print(f"Create DeviceMesh: {dims} {ranks}")
+        logger.info(f"Create DeviceMesh: {dims} {ranks}")
         self.define(result, 4)
 
     def CallFunction(self, function: str, args: List[Any], kwargs: Dict[str, Any]):
@@ -50,7 +51,6 @@ class Worker:
         module = importlib.import_module(modulename)
         func = getattr(module, funcname)
         r = func(*args, **kwargs)
-        print(f"PRODUCED RESULT: {r}")
 
     def Exit(self):
         raise StopIteration()
@@ -62,13 +62,16 @@ class Worker:
         while True:
             _, msg = self.q.recv()
             try:
-                print(msg)
+                logger.info(f"event: {msg}")
                 self.handle_message(msg)
             except StopIteration:
                 return
 
 
 def worker_main():
+    rank = int(os.environ['RANK'])
+    initialize_logging(process_name=f'worker_{rank}')
+    logger.info(f"starting")
     q = get_message_queue()
     rank = int(os.environ['RANK'])
     world = int(os.environ['WORLD_SIZE'])

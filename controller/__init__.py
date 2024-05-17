@@ -1,10 +1,10 @@
 from supervisor import ProcessExited, ProcessList, Context, Host, FunctionCall
 from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple
-from torch import dtype, layout, device, memory_format
+# from torch import dtype, layout, device, memory_format
 from typing_extensions import Unpack
-import torch
+# import torch
 from contextlib import contextmanager
-from .base_tensor import BaseTensor
+# from .base_tensor import BaseTensor
 import math
 import os
 from . import worker
@@ -68,6 +68,7 @@ class DeviceMesh(Referenceable):
         # Create process groups as subsets
         msg = worker.CreateDeviceMesh(self.ctrl.ref(), self.dims, [p.rank for p in self.processes])
         self.ctrl.all_processes.send(msg)
+
         return msg.result
 
     def stack(self, **kwargs):
@@ -134,12 +135,12 @@ class Stream:
 
 
 class TensorOptions(TypedDict, total=False):
-    dtype: dtype
-    layer: layout
-    device: Union[str, device]
+    dtype: 'torch.dtype'
+    layer: 'torch.layout'
+    device: Union[str, 'torch.device']
     requires_grad: bool
     pin_memory: bool
-    memory_format: memory_format
+    memory_format: 'torch.memory_format'
 
 
 class Pipe:
@@ -328,11 +329,12 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     return results
 
 
-class DTensor(BaseTensor):
+#class DTensor(BaseTensor):
+class DTensor:
     @staticmethod
     def __new__(
         cls,
-        fake: torch.Tensor,
+        fake: 'torch.Tensor',
         ref: 'Ref',
         sharding: 'Optional[Sharding]',
     ):
@@ -364,7 +366,7 @@ class DTensor(BaseTensor):
         return inner_tensors['_fake']
 
     @classmethod
-    def to_remote(cls, t: torch.Tensor, sharding: 'Sharding'):
+    def to_remote(cls, t: 'torch.Tensor', sharding: 'Sharding'):
         sharding = Sharding.lift(sharding)
         f = fake_mode.from_tensor(t)
         r = RemoteRef()

@@ -17,6 +17,7 @@ from random import random
 import zmq
 from supervisor import HEARTBEAT_INTERVAL, HEARTBEAT_LIVENESS, ProcessFailedToStart
 from supervisor.logging import gethostname, initialize_logging
+import uuid
 
 logger: logging.Logger = logging.getLogger(__name__)
 ABORT_INTERVAL = 5
@@ -87,8 +88,7 @@ class Process:
         self.proc_id_bytes: bytes = proc_id.to_bytes(8, byteorder="little")
         self.deferred_sends: Optional[List[bytes]] = []
 
-    def _send(self, _msg: object) -> None:
-        msg = pickle.dumps(_msg)
+    def _send(self, msg: bytes) -> None:
         if self.deferred_sends is not None:
             self.deferred_sends.append(msg)
         else:
@@ -128,7 +128,7 @@ class Host:
         # all processes on this host will use the same
         # socket.
         self.proc_comm: zmq.Socket = self.context.socket(zmq.ROUTER)
-        self.proc_addr = f"ipc:///tmp/proc_{os.getpid()}"
+        self.proc_addr = f"ipc://{uuid.uuid4()}"
         self.proc_comm.bind(self.proc_addr)
         self.poller.register(self.proc_comm, zmq.POLLIN)
 

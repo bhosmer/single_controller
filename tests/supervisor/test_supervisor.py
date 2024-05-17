@@ -214,10 +214,10 @@ class SupervisorUnitTests(unittest.TestCase):
 
             launch(2)
             self.assertEqual(recv(), ("_started", 2, 1))
-            send(("send", 2, "a message"))
+            send(("send", 2, pickle.dumps("a message")))
             msg_queue = get_message_queue(2, host.proc_addr)
             self.assertEqual(msg_queue.recv().message, "a message")
-            send(("send", 2, "another message"))
+            send(("send", 2, pickle.dumps("another message")))
             self.assertEqual(msg_queue.recv().message, "another message")
             msg_queue.send(b"a reply")
             msg_queue.close()
@@ -277,7 +277,7 @@ class SupervisorUnitTests(unittest.TestCase):
                     None,
                 )
                 self.assertEqual(socket.recv_pyobj(), expected)
-                self.assertEqual(socket.recv_pyobj(), ("send", 0, "hello"))
+                self.assertEqual(socket.recv_pyobj(), ("send", 0, pickle.dumps("hello")))
                 self.assertTrue(pm.recvready(timeout=1) == [])
                 socket.send_pyobj(("_started", 0, 7))
                 socket.send_pyobj(("_response", 0, pickle.dumps("nope")))

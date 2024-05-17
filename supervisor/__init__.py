@@ -292,9 +292,10 @@ class Process:
         self._state = "aborted"
 
     def send(self, msg: object) -> None:
+        msg = pickle.dumps(msg)
         self._context._schedule(lambda: self._send(msg))
 
-    def _send(self, msg: object) -> None:
+    def _send(self, msg: bytes) -> None:
         if self._state != "aborted":
             self._context._sends += 1
             self.host._send(pickle.dumps(("send", self._id, msg)))
@@ -489,8 +490,15 @@ def TTL(timeout: float):
 
 class ProcessList(tuple):
     def send(self, msg: Any) -> None:
+        if not self:
+            return
+        ctx = self[0]._context
+        msg = pickle.dumps(msg)
+        ctx._schedule(lambda: self._send(msg))
+
+    def _send(self, msg: bytes) -> None:
         for p in self:
-            p.send(msg)
+            p._send(msg)
 
     def __getitem__(self, index):
         result = super().__getitem__(index)
@@ -781,10 +789,10 @@ class Context(FilteredMessageQueue):
             for i, h in enumerate(hosts)
             for j in range(processes_per_host)
         )
-        self._schedule(lambda: self._launch_processes(procs, message=args if isinstance(args, _FunctionCall) else None))
+        self._schedule(lambda: self._launch_processes(procs, message=pickle.dumps(args) if isinstance(args, _FunctionCall) else None))
         return procs
 
-    def _launch_processes(self, procs: Sequence[Process], message: Optional['_FunctionCall']) -> None:
+    def _launch_processes(self, procs: Sequence[Process], message: Optional[bytes]) -> None:
         for p in procs:
             p.host._launch(p)
             if message is not None:
