@@ -752,7 +752,7 @@ class Context(FilteredMessageQueue):
         cwd: Optional[str] = None,
         name: Optional[str] = None,
         simulate: bool = False,
-    ) -> Tuple[Process, ...]:
+    ) -> ProcessList:
         world_size = processes_per_host * len(hosts)
         if name is None:
             name = f"pg{self._pg_name}"
