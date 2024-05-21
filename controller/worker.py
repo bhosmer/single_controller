@@ -47,6 +47,9 @@ class CommandGroup(NamedTuple):
 class DeleteRefs(NamedTuple):
     refs: List[int]
 
+class Restarted(NamedTuple):
+    result: int
+
 def log(*args):
     logger.info(*args)
 
@@ -120,14 +123,17 @@ class Worker:
                 return
 
 
-def worker_main():
+def worker_main(_restartable):
     rank = int(os.environ['RANK'])
     initialize_logging(process_name=f'worker_{rank}')
-    logger.info(f"starting")
+    logger.info("starting, restartable=%s", _restartable)
     q = get_message_queue()
-    rank = int(os.environ['RANK'])
     world = int(os.environ['WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
     # CUDA_VISIBLE_DEVICES should be set on launch to LOCAL_RANK
     worker = Worker(q, rank, world, local_rank)
     worker.event_loop()
+    while _restartable:
+        q.send(Restarted(0))
+        logger.info("restarting")
+        worker.event_loop()

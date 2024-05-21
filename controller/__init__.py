@@ -35,16 +35,24 @@ else:
     fake_mode = FakeTensorMode()
 
 class _Controller:
-    def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int):
+    def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
         self.ctx = ctx
         self.hosts = hosts
-        self.all_processes = ctx.create_process_group(hosts, FunctionCall('controller.worker.worker_main'),
-                                                      processes_per_host=gpu_per_host,
-                                                      env={'CUDA_VISIBLE_DEVICES': '$LOCAL_RANK'})
+        self.all_processes = self._create_pg(ctx, hosts, gpu_per_host) if _processes is None else _processes
         self.next_ref = 0
         self.exited = {}
         self.pending_del: Dict[DeviceMesh, List[int]] = defaultdict(list)
         self._shutdown = False
+        global _active_stream
+        _active_stream = Stream("main")
+
+    @staticmethod
+    def _create_pg(ctx: Context, hosts: List[Host], gpu_per_host: int, _restartable=False):
+        return ctx.create_process_group(hosts,
+                                        FunctionCall('controller.worker.worker_main',
+                                                     _restartable=_restartable),
+                                        processes_per_host=gpu_per_host,
+                                        env={'CUDA_VISIBLE_DEVICES': '$LOCAL_RANK'})
 
     def shutdown(self):
         self._shutdown = True
@@ -54,7 +62,7 @@ class _Controller:
 
     def _process_event(self):
         sender, event = self.ctx.recv()
-        if isinstance(event, ProcessExited):
+        if isinstance(event, (ProcessExited, worker.Restarted)):
             self.exited[sender] = event.result
 
     def ref(self) -> 'Ref':
@@ -139,8 +147,8 @@ class DeviceMesh(Referenceable):
     def rotate(self, **kwargs: Dict[str, int]):
         raise NotImplementedError()
 
-def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int):
-    ctrl = _Controller(ctx, hosts, gpu_per_host)
+def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
+    ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
     return DeviceMesh(ctrl, ctrl.all_processes, {'host': len(ctrl.all_processes) // gpu_per_host, 'gpu': gpu_per_host})
 
 
