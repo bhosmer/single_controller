@@ -23,17 +23,12 @@ class Ref:
         return Ref, (self.id,)
 
 class CreateDeviceMesh(NamedTuple):
-    result: Ref
+    result: int
     dims: Dict[str, int]
     ranks: List[int]
 
 class CallFunction(NamedTuple):
-    function: str
-    args: Tuple[Any, ...]
-    kwargs: Dict[str, Any]
-
-class CallBuiltin(NamedTuple):
-    results: Tuple[Ref]
+    results: Tuple[int,...]
     function: Union[str, Callable]
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
@@ -69,30 +64,29 @@ class Worker:
             return fn(*event)
         raise RuntimeError(f"unhandled event: {event}")
 
-    def CreateDeviceMesh(self, result: Ref, dims: Dict[str, int], ranks: List[int]):
+    def CreateDeviceMesh(self, result: int, dims: Dict[str, int], ranks: List[int]):
         if self.rank in ranks:
             self.define(result, ('devicemesh', dims, ranks))
-
-    def CallFunction(self, function: str, args: List[Any], kwargs: Dict[str, Any]):
-        modulename, funcname = function.rsplit('.', 1)
-        module = importlib.import_module(modulename)
-        func = getattr(module, funcname)
-        args, kwargs = tree_map(self.lookup, (args, kwargs))
-        func(*args, **kwargs)
 
     def lookup(self, a: Any):
         if isinstance(a, Ref):
             return self.env[a.id]
         return a
 
-    def CallBuiltin(self, results: Tuple[Ref], function: Union[str, Callable], args: Tuple[Any, ...], kwargs: Dict[str, Any]):
+    def CallFunction(self, results: Tuple[int], function: Union[str, Callable], args: Tuple[Any, ...], kwargs: Dict[str, Any]):
         args, kwargs = tree_map(self.lookup, (args, kwargs))
         if isinstance(function, str):
             first, *parts = function.split('.')
-            function = globals()[first]
-            for p in parts:
-                function = getattr(function, p)
-            assert isinstance(function, Callable)
+            if first == 'torch':
+                function = globals()[first]
+                for p in parts:
+                    function = getattr(function, p)
+                assert isinstance(function, Callable)
+            else:
+                modulename, funcname = function.rsplit('.', 1)
+                module = importlib.import_module(modulename)
+                function = getattr(module, funcname)
+
         result = function(*args, **kwargs)
         tensors, _ = flatten(result, lambda x: isinstance(x, torch.Tensor))
         assert len(results) == len(tensors)
@@ -110,8 +104,8 @@ class Worker:
         for id in refs:
             del self.env[id]
 
-    def define(self, r: Ref, value: Any):
-        self.env[r.id] = value
+    def define(self, r: int, value: Any):
+        self.env[r] = value
 
     def event_loop(self):
         while True:

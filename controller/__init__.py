@@ -1,6 +1,7 @@
 from torch import device
+from torch.types import Device
 from supervisor import ProcessExited, ProcessList, Context, Host, FunctionCall
-from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple
+from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple, Callable
 from torch.utils._python_dispatch import TorchDispatchMode
 from .tree import flatten, tree_map
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -17,6 +18,7 @@ from . import worker
 from .worker import Ref
 from abc import ABC, abstractmethod
 from collections import defaultdict
+import itertools
 
 check_correctness_per_operator = False
 if check_correctness_per_operator:
@@ -65,8 +67,8 @@ class _Controller:
         if isinstance(event, (ProcessExited, worker.Restarted)):
             self.exited[sender] = event.result
 
-    def ref(self) -> 'Ref':
-        r = Ref(self.next_ref)
+    def ref(self) -> int:
+        r = self.next_ref
         self.next_ref += 1
         return r
 
@@ -83,7 +85,6 @@ class _Controller:
 
 
 class Referenceable:
-
     def delete_ref(self, ref):
         raise NotImplementedError("no delete_ref method")
 
@@ -93,7 +94,7 @@ class Referenceable:
     def __reduce_ex__(self, protocol):
         if self.ref is None:
             self.ref = self.define_ref()
-        return Ref, (self.ref.id,)
+        return Ref, (self.ref,)
 
     def __del__(self):
         if self.ref is not None:
@@ -109,6 +110,9 @@ class DeviceMesh(Referenceable):
         self.processes = processes
         self.ref = None
 
+    def __repr__(self):
+        return f'<DeviceMesh({tuple(self.dims.keys())}, {tuple(self.dims.values())}) at {hex(id(self))}>'
+
     def define_ref(self):
         # Optimize: we do not have to send device meshes to all workers if we can
         # Create process groups as subsets
@@ -117,9 +121,9 @@ class DeviceMesh(Referenceable):
 
         return msg.result
 
-    def delete_ref(self, ref: Ref):
+    def delete_ref(self, ref: int):
         if not self.ctrl._shutdown:
-            self._send(worker.DeleteRefs([ref.id]))
+            self._send(worker.DeleteRefs([ref]))
 
     def _send(self, cmd: NamedTuple):
         to_delete = self.ctrl._flush_deletes(self)
@@ -131,21 +135,52 @@ class DeviceMesh(Referenceable):
     def stack(self, **kwargs):
         raise NotImplementedError()
 
-    def call(self, func: str, *args, **kwargs):
-        msg = worker.CallFunction(func, args, kwargs)
-        self.processes.send(msg)
-
-    def index(self, **kwargs) -> 'DeviceMesh':
+    def __call__(self, **kwargs) -> 'DeviceMesh':
         """
         m.index(batch=3) or m.index(batch=slice(3, None))
         """
-        pass
+        ranges = []
+        stride = 1
+        offset = 0
+        dims = {}
+        sizes = list(self.dims.values())
+        for i, (k, v) in enumerate(self.dims.items()):
+            stride = math.prod(sizes[i+1:])
+            if k in kwargs:
+                e = kwargs.pop(k)
+                if isinstance(e, slice):
+                    the_range = range(*e.indices(v))
+                    dims[k] = len(the_range)
+                    ranges.append(stride*x for x in the_range)
+                else:
+                    if e >= v or e < 0:
+                        raise IndexError('index out of range')
+                    offset += e*stride
+            else:
+                dims[k] = v
+                ranges.append(range(0, v*stride, stride))
+        if kwargs:
+            raise TypeError(f'{self} does not have dimension(s) named {tuple(kwargs.keys())}')
+
+        indices = [offset + sum(x) for x in itertools.product(*ranges)]
+        processes = ProcessList(self.processes[x] for x in indices)
+        return DeviceMesh(self.ctrl, processes, dims)
+
 
     def split(self, **kwargs: Dict[str, Tuple[str, ...]]):
         raise NotImplementedError()
 
     def rotate(self, **kwargs: Dict[str, int]):
         raise NotImplementedError()
+
+class RemoteFunction:
+    def __init__(self, func: str, result: Optional[Callable]=None):
+        self.func = func
+        self.result = result
+
+    def __call__(self, *args, **kwargs):
+        return dtensor_dispatch(self.func, args, kwargs, _active_mesh, _active_stream, self.result)
+
 
 def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
     ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
@@ -159,6 +194,9 @@ class Stream:
     def __init__(self, name: str):
         self.name = name
         self.ctrl = None
+
+    def __repr__(self):
+        return f'<Stream({repr(self.name)}) at {hex(id(self))}>'
 
     def _use_controller(self, ctrl: '_Controller'):
         if self.ctrl is None:
@@ -248,7 +286,16 @@ class Tensor(Referenceable, BaseTensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        return dtensor_dispatch(func, args, kwargs, _active_mesh, _active_stream)
+        if isinstance(func, torch._ops.OpOverload):
+            function = "torch.ops."  + str(func)
+        else:
+            function = func
+
+        def result_type(*args, **kwargs):
+            with fake_mode:
+                return func(*args, **kwargs)
+
+        return dtensor_dispatch(function, args, kwargs, _active_mesh, _active_stream, result_type)
 
     def __init__(self, fake: torch.Tensor, mesh: DeviceMesh, stream: Stream):
         pass
@@ -327,9 +374,9 @@ class Tensor(Referenceable, BaseTensor):
         """
         pass
 
-    def delete_ref(self, ref: Ref):
+    def delete_ref(self, ref: int):
         mesh = self.mesh
-        mesh.ctrl.pending_del[mesh].append(ref.id)
+        mesh.ctrl.pending_del[mesh].append(ref)
 
 _explain = """\
 LOCAL_TENSOR
@@ -347,14 +394,16 @@ move the tensor to the correct stream with `.borrow`.
 
 explain = dict(entry.split('\n', 1) for entry in _explain.split('\n\n'))
 
-def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stream: Stream):
 
+def dtensor_check(func, args, kwargs, device_mesh, stream) -> Tuple[List['Tensor'], Any]:
     def stringify(t):
         if isinstance(t, Tensor):
             if t.mesh is not device_mesh:
                 return 'WRONG_MESH'
             elif t.stream is not stream:
                 return 'WRONG_STREAM'
+            else:
+                return '.'
         elif isinstance(t, torch.Tensor):
             return 'LOCAL_TENSOR'
         else:
@@ -370,32 +419,34 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
                 actuals = f'{actuals}, ' + ', '.join(f'{k}={v}' for k, v in kwargs.items())
 
             call = f"{func}({actuals})"
+            dmesh = f'active_mesh = {device_mesh}\nactive_stream = {stream}'
             help = '\n'.join(f'{k}: {v}' for k, v in explain.items() if k in call)
-            raise TypeError(f'Mismatched arguments to distributed tensor operation:\n{call}\n{help}')
+            raise TypeError(f'Mismatched arguments to distributed tensor operation:\n\n  {call}\n\n{dmesh}\n{help}')
 
     dtensors, unflatten = flatten((args, kwargs), tensor_check)
+    return dtensors, unflatten
+
+def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stream: Stream, result_type):
+    dtensors, unflatten = dtensor_check(func, args, kwargs, device_mesh, stream)
     assert device_mesh is not None
     ctrl = device_mesh.ctrl
     stream._use_controller(ctrl)
 
-
-    fake_input_tensors = [d._fake for d in dtensors]
-    with fake_mode:
+    if callable(result_type):
+        fake_input_tensors = [d._fake for d in dtensors]
         fake_args, fake_kwargs = unflatten(fake_input_tensors)
-        result = func(*fake_args, **fake_kwargs)
-
+        result = result_type(*fake_args, **fake_kwargs)
+        fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
+    else:
+        result = result_type
+        fake_map = {}
 
     fake_result_dtensors, unflatten_result = flatten(result, lambda x: isinstance(x, torch.Tensor))
-    fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
 
     # sometimes operators return references to inputs, in which case the result should be the same DTensor object
     # otherwise we create a new DTensor with a new RemoteRef for the result
     result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream) for fake in fake_result_dtensors)
-
-    if isinstance(func, torch._ops.OpOverload):
-        func = "torch.ops."  + str(func)
-
-    device_mesh._send(worker.CallBuiltin(result_dtensors, func, args, kwargs))
+    device_mesh._send(worker.CallFunction(tuple(r.ref for r in result_dtensors), func, args, kwargs))
     results = unflatten_result(result_dtensors)
     return results
 
@@ -411,7 +462,7 @@ class _ActiveMesh(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if _active_mesh is None:
             return func(*args, **kwargs)
-        return dtensor_dispatch(func, args, kwargs, _active_mesh, _active_stream)
+        return Tensor.__torch_dispatch__(func, types, args, kwargs)
 
 
 @contextmanager
@@ -440,8 +491,6 @@ def active_stream(stream: Stream):
 def active_mesh(mesh: Optional[DeviceMesh]):
     global _active_mesh
     _active_mesh, old = mesh, _active_mesh
-    if old is not None and mesh is not None:
-        old._flush_to_delete()
     try:
         with _dispatch():
             yield
