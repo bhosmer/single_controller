@@ -1,8 +1,14 @@
+from torch import device
 from supervisor import ProcessExited, ProcessList, Context, Host, FunctionCall
 from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple
-# from torch import dtype, layout, device, memory_format
+from torch.utils._python_dispatch import TorchDispatchMode
+from .tree import flatten, tree_map
+from torch._subclasses.fake_tensor import FakeTensorMode
+from .base_tensor import BaseTensor
+
+from torch import dtype, layout, device, memory_format
 from typing_extensions import Unpack
-# import torch
+import torch
 from contextlib import contextmanager
 # from .base_tensor import BaseTensor
 import math
@@ -10,6 +16,23 @@ import os
 from . import worker
 from .worker import Ref
 from abc import ABC, abstractmethod
+from collections import defaultdict
+
+check_correctness_per_operator = False
+if check_correctness_per_operator:
+    class RealMode:
+        def from_tensor(self, t):
+            return t
+
+        def __enter__(self):
+            pass
+
+        def __exit__(self, *args):
+            pass
+
+    fake_mode = RealMode()
+else:
+    fake_mode = FakeTensorMode()
 
 class _Controller:
     def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int):
@@ -20,9 +43,11 @@ class _Controller:
                                                       env={'CUDA_VISIBLE_DEVICES': '$LOCAL_RANK'})
         self.next_ref = 0
         self.exited = {}
-        self.pending_del = []
+        self.pending_del: Dict[DeviceMesh, List[int]] = defaultdict(list)
+        self._shutdown = False
 
     def shutdown(self):
+        self._shutdown = True
         self.all_processes.send(worker.Exit())
         while len(self.exited) < len(self.all_processes):
             self._process_event()
@@ -37,21 +62,34 @@ class _Controller:
         self.next_ref += 1
         return r
 
+    def _flush_deletes(self, device_mesh: 'DeviceMesh') -> Optional[worker.DeleteRefs]:
+        to_delete = None
+        if device_mesh in self.pending_del:
+            to_delete = worker.DeleteRefs(self.pending_del.pop(device_mesh))
+        # we also have to make sure if we have deletes to other device meshes,
+        # they get processed before we do an op that will try to allocate memory
+        for k, v in self.pending_del.items():
+            k._send(worker.DeleteRefs(v))
+        self.pending_del.clear()
+        return to_delete
+
 
 class Referenceable:
-    ctrl: _Controller
+
+    def delete_ref(self, ref):
+        raise NotImplementedError("no delete_ref method")
 
     def define_ref(self):
         raise NotImplementedError("undefined ref with no define_ref method")
 
-    def __reduce__(self):
+    def __reduce_ex__(self, protocol):
         if self.ref is None:
             self.ref = self.define_ref()
         return Ref, (self.ref.id,)
 
     def __del__(self):
         if self.ref is not None:
-            self.ctrl.pending_del.append(self.ref)
+            self.delete_ref(self.ref)
 
 PyTree = Union[Dict[str, 'PyTree'], List['PyTree'], Tuple['PyTree',...], 'Tensor']
 
@@ -71,12 +109,19 @@ class DeviceMesh(Referenceable):
 
         return msg.result
 
+    def delete_ref(self, ref: Ref):
+        if not self.ctrl._shutdown:
+            self._send(worker.DeleteRefs([ref.id]))
+
+    def _send(self, cmd: NamedTuple):
+        to_delete = self.ctrl._flush_deletes(self)
+        if to_delete:
+            self.processes.send(worker.CommandGroup([to_delete, cmd]))
+        else:
+            self.processes.send(cmd)
+
     def stack(self, **kwargs):
         raise NotImplementedError()
-
-    def __getattr__(self, name):
-        if name in self.dims:
-            return DeviceMeshDim(self, name)
 
     def call(self, func: str, *args, **kwargs):
         msg = worker.CallFunction(func, args, kwargs)
@@ -103,12 +148,28 @@ def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int):
 class Stream:
     name: str
 
+    def __init__(self, name: str):
+        self.name = name
+        self.ctrl = None
+
+    def _use_controller(self, ctrl: '_Controller'):
+        if self.ctrl is None:
+            self.ctrl = ctrl
+        elif self.ctrl is not ctrl:
+            raise TypeError('DeviceMesh and stream controller are different.')
+
     def wait_for(self, other: 'Stream'):
         """
         Blocks execution of this stream until the other stream completes the work that has been scheduled.
         Any tensors which have been borrowed from this stream to other, and then freed, will be returned
         to this stream, reclaiming the memory if there are no other references to them.
         """
+        if other.ctrl is None:
+            # nothing has happened yet on other stream, so we
+            # can return
+            return
+        self._use_controller(other.ctrl)
+
         raise NotImplementedError()
 
     @contextmanager
@@ -131,6 +192,7 @@ class Stream:
 
         If not `mutable` both `self` and `t.stream` can read from t's storage but neither can write to it.
         """
+        self._use_controller(t.mesh.ctrl)
         raise NotImplementedError()
 
 
@@ -151,9 +213,41 @@ class Pipe:
         raise NotImplementedError()
 
 
-class Tensor:
+class Tensor(Referenceable, BaseTensor):
     stream: Stream
     mesh: DeviceMesh
+
+
+    def __new__(
+        cls,
+        fake: torch.Tensor, mesh: DeviceMesh, stream: Stream
+    ):
+        r = torch.Tensor._make_wrapper_subclass(
+            cls,
+            fake.size(),
+            strides=fake.stride(),
+            storage_offset=fake.storage_offset(),
+            device=fake.device,  # This is the device of of either input tensor or first tensor of a list
+            dtype=fake.dtype,
+            layout=fake.layout,
+            requires_grad=fake.requires_grad,
+        )
+        r._fake = fake
+        r.ref = mesh.ctrl.ref()
+        r.mesh = mesh
+        r.stream = stream
+        return r
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        return dtensor_dispatch(func, args, kwargs, _active_mesh, _active_stream)
+
+    def __init__(self, fake: torch.Tensor, mesh: DeviceMesh, stream: Stream):
+        pass
+
+    def __repr__(self):
+       return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={self._fake})"
+
 
     def to_mesh(self, mesh: DeviceMesh, stream: Optional[Stream]=None):
         """
@@ -225,218 +319,123 @@ class Tensor:
         """
         pass
 
+    def delete_ref(self, ref: Ref):
+        mesh = self.mesh
+        mesh.ctrl.pending_del[mesh].append(ref.id)
 
+_explain = """\
+LOCAL_TENSOR
+A local (non-distributed) tensor is being passed while a device_mesh is active.
+If you want to do local tensor compute use `with active_mesh(None):`
 
+WRONG_MESH
+A tensor being passed is on a device mesh that is not the current device_mesh.
+Use `with active_mesh(m):` to switch the active mesh, or move the tensor to the correct device mesh with `to_mesh`/`on_mesh`.
 
+WRONG_STREAM
+A tensor being passed is on a stream that is not the current active stream. Use with `active_stream(s)` to switch streams, or
+move the tensor to the correct stream with `.borrow`.
+"""
 
+explain = dict(entry.split('\n', 1) for entry in _explain.split('\n\n'))
 
-def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
-    if func is torch.ops.aten.detach.default:
-        if not args[0].requires_grad:
-            return args[0]
-
-    worker = sharding.mesh.flat_workers[0] if sharding else None
+def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stream: Stream):
 
     def stringify(t):
-        if isinstance(t, DTensor):
-            return 'DTensor'
+        if isinstance(t, Tensor):
+            if t.mesh is not device_mesh:
+                return 'WRONG_MESH'
+            elif t.stream is not stream:
+                return 'WRONG_STREAM'
         elif isinstance(t, torch.Tensor):
-            return 'Tensor'
+            return 'LOCAL_TENSOR'
         else:
             return t
 
-    def is_dtensor_no_tensors(x):
-        if isinstance(x, DTensor):
-            return True
-        elif isinstance(x, torch.Tensor):
-            raise NotImplementedError(f"mixed DTensor/local tensor {func}(args, kwargs)={tree_map(stringify, (args, kwargs))}")
+    def tensor_check(x):
+        if isinstance(x, torch.Tensor):
+            if isinstance(x, Tensor) and x.mesh is device_mesh and x.stream is stream:
+                return True
+            fargs, fkwargs = tree_map(stringify, (args, kwargs))
+            actuals = ', '.join(str(a) for a in fargs)
+            if fkwargs:
+                actuals = f'{actuals}, ' + ', '.join(f'{k}={v}' for k, v in kwargs.items())
 
-    dtensors, unflatten = flatten((args, kwargs), is_dtensor_no_tensors)
+            call = f"{func}({actuals})"
+            help = '\n'.join(f'{k}: {v}' for k, v in explain.items() if k in call)
+            raise TypeError(f'Mismatched arguments to distributed tensor operation:\n{call}\n{help}')
+
+    dtensors, unflatten = flatten((args, kwargs), tensor_check)
+    assert device_mesh is not None
+    ctrl = device_mesh.ctrl
+    stream._use_controller(ctrl)
+
 
     fake_input_tensors = [d._fake for d in dtensors]
-    if _trace is None and do_fake_mode_caching:
-        fake_input_tensors_key =  [fake_key(d._fake) for d in dtensors]
-        fake_cache_key = str((id(func), unflatten(fake_input_tensors_key)))
-        result = fake_cache.get(fake_cache_key, None)
-        if result is None:
-            with fake_mode:
-                fake_args, fake_kwargs = unflatten(fake_input_tensors)
-                result = func(*fake_args, **fake_kwargs)
-            fake_cache[fake_cache_key] = result
-    else:
-        with fake_mode:
-            fake_args, fake_kwargs = unflatten(fake_input_tensors)
-            result = func(*fake_args, **fake_kwargs)
+    with fake_mode:
+        fake_args, fake_kwargs = unflatten(fake_input_tensors)
+        result = func(*fake_args, **fake_kwargs)
 
 
-    fake_result_dtensors, unflatten_result = flatten(result, is_tensor)
+    fake_result_dtensors, unflatten_result = flatten(result, lambda x: isinstance(x, torch.Tensor))
     fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
 
     # sometimes operators return references to inputs, in which case the result should be the same DTensor object
     # otherwise we create a new DTensor with a new RemoteRef for the result
-    result_dtensors = [dtensors[fake_map[id(fake)]] if id(fake) in fake_map else DTensor(fake, RemoteRef(), None) for fake in fake_result_dtensors]
-    mesh, modified_args, modified_kwargs = propagate_sharding(func, args, kwargs, dtensors, result_dtensors, sharding)
+    result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream) for fake in fake_result_dtensors)
 
-    for i, r in enumerate(result_dtensors):
-        assert r._sharding is not None, f"sharding unset for output {i} of {str(func)} fake outputs: {fake_result_dtensors}"
+    if isinstance(func, torch._ops.OpOverload):
+        func = "torch.ops."  + str(func)
 
-    def get_ref(x):
-        return x if not isinstance(x, DTensor) else x._ref
-
-    ref_args, ref_kwargs = tree_map(get_ref, modified_args), tree_map(get_ref, modified_kwargs)
-    ref_results = [r._ref for r in result_dtensors]
-    if _trace is not None:
-        m, cmds = _trace
-        assert m is mesh, "multiple compiled mesh NYI"
-        cmds.append((func, ref_args, ref_kwargs, ref_results, result))
-    else:
-        for worker in mesh.flat_workers:
-            worker.send_command(func, ref_args, ref_kwargs, ref_results)
-
+    device_mesh._send(worker.CallBuiltin(result_dtensors, func, args, kwargs))
     results = unflatten_result(result_dtensors)
-
-    if check_correctness_per_operator:
-        key = str(func)
-        print(key, args, kwargs, result_dtensors)
-        if "_." in key:
-            for i, dtensor in enumerate(dtensors):
-                rem = dtensor.to_local().wait()
-                # print(dtensor._fake.sum(), rem.sum())
-                if torch.all(torch.isfinite(dtensor._fake)) and torch.all(torch.isfinite(rem)):
-                    torch.testing.assert_close(dtensor._fake, rem, atol=1e-03, rtol=1e-03)
-                else:
-                    pass #print("nonfinite present...")
-                # don't let small differences accumulate over time when correctness testing
-                try:
-                    dtensor._fake.copy_(rem)
-                except RuntimeError as e:
-                    assert "unsupported operation" in str(e), "Weird tensor shapes cannot be moved around"
-        for i, dtensor in enumerate(result_dtensors):
-            rem = dtensor.to_local().wait()
-            if 'aten._scaled_dot_product_efficient_attention.default' == key and i > 1:
-                break
-            # print(dtensor._fake.sum(), rem.sum())
-            if torch.all(torch.isfinite(dtensor._fake)) and torch.all(torch.isfinite(rem)):
-                torch.testing.assert_close(dtensor._fake, rem, atol=1e-03, rtol=1e-03)
-            else:
-                pass #print("nonfinite present...")
-            # don't let small differences accumulate over time when correctness testing
-            try:
-                dtensor._fake.copy_(rem)
-            except RuntimeError as e:
-                assert "unsupported operation" in str(e), "Weird tensor shapes cannot be moved around"
-
     return results
 
 
-#class DTensor(BaseTensor):
-class DTensor:
-    @staticmethod
-    def __new__(
-        cls,
-        fake: 'torch.Tensor',
-        ref: 'Ref',
-        sharding: 'Optional[Sharding]',
-    ):
-        r = torch.Tensor._make_wrapper_subclass(
-            cls,
-            fake.size(),
-            strides=fake.stride(),
-            storage_offset=fake.storage_offset(),
-            device=fake.device,  # This is the device of of either input tensor or first tensor of a list
-            dtype=fake.dtype,
-            layout=fake.layout,
-            requires_grad=fake.requires_grad,
-        )
-        r._ref = ref
-        r._fake = fake
-        assert sharding is None or isinstance(sharding, Sharding)
-        r._sharding = sharding
-        return r
-
-    def __init__(self, fake, ref, worker):
-        pass
+_active_stream: Stream = Stream('main')
+_active_mesh: Optional[DeviceMesh] = None
+_dispatch_enabled = False
 
 
-    def __tensor_flatten__(self):
-        return ['_fake'], (self._ref, self._sharding)
+class _ActiveMesh(TorchDispatchMode):
+    ignore = ['profiler._record_function_exit._RecordFunction']
 
-    @staticmethod
-    def __tensor_unflatten__(inner_tensors, meta):
-        return inner_tensors['_fake']
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if _active_mesh is None:
+            return func(*args, **kwargs)
+        return dtensor_dispatch(func, args, kwargs, _active_mesh, _active_stream)
 
-    @classmethod
-    def to_remote(cls, t: 'torch.Tensor', sharding: 'Sharding'):
-        sharding = Sharding.lift(sharding)
-        f = fake_mode.from_tensor(t)
-        r = RemoteRef()
 
-        shape = sharding.mesh.shape
+@contextmanager
+def _dispatch():
+    global _dispatch_enabled
+    if _dispatch_enabled:
+        yield
+    else:
+        _dispatch_enabled = True
+        try:
+            with _ActiveMesh():
+                yield
+        finally:
+            _dispatch_enabled = False
 
-        batch_dim = 0
+@contextmanager
+def active_stream(stream: Stream):
+    global _active_stream
+    _active_stream, old = stream, _active_stream
+    try:
+        yield
+    finally:
+        _active_stream = old
 
-        def split_dim(i, to_split):
-            nonlocal t
-            sizes = t.size()
-            split_adjusted = to_split + i
-            d = sizes[split_adjusted]
-            assert d % shape.size(i) == 0, "NOT EVENLY SPLIT"
-            chunk_size = d // shape.size(i)
-            t = t.reshape(*sizes[:split_adjusted], shape.size(i), chunk_size, *sizes[split_adjusted+1:])
-            t = t.movedim(split_adjusted, i)
-            return chunk_size
-
-        for i, ann in enumerate(sharding.sharding):
-            if ann == "r":
-                t = t.expand(shape.size(i), *t.size())
-                t = t.movedim(0, i)
-            elif isinstance(ann, int):
-                split_dim(i, ann)
-            elif ann == "b":
-                chunk_size = split_dim(i, batch_dim)
-                sizes = f.size()
-                index = tuple(slice(0, chunk_size) if i == batch_dim else slice(None) for i in range(f.dim()))
-                f = f[index]
-                batch_dim += 1
-            else:
-                raise NotImplementedError(f"Annotation: {ann}")
-
-        if shape.dim() == 0:
-            worker = sharding.mesh._workers.workers[shape.item()]
-            worker.send_value(r, t)
-        else:
-            t = t.flatten(0, shape.dim() - 1)
-            shape_flat = shape.flatten()
-            for idx, local in zip(shape_flat, t):
-                worker = sharding.mesh._workers.workers[idx]
-                worker.send_value(r, local)
-
-        return DTensor(f, r, sharding)
-
-    def __repr__(self):
-       return f"DTensor(sharding={self.sharding}, shape={list(self.shape)})"
-
-    @classmethod
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        return dtensor_dispatch(func, args, kwargs)
-
-    def to_local(self):
-        return self._sharding.manager.schedule(reconstruct_tensor(self))
-
-    def __del__(self):
-        if sys is None or _trace is not None:
-            return # pytho shutdown
-        if self._sharding is None:
-            return # an error happening during construction and this wasn't initialized
-        for worker in self._sharding.mesh.flat_workers:
-            worker.del_value(self._ref)
-
-    @property
-    def sharding(self):
-        return self._sharding
-
-    def to_sharding_(self, new_sharding):
-        if not isinstance(new_sharding, Sharding):
-            new_sharding = Sharding(self.sharding.mesh, new_sharding)
-        new_sharding.apply_inplace(self)
-        return self
+@contextmanager
+def active_mesh(mesh: Optional[DeviceMesh]):
+    global _active_mesh
+    _active_mesh, old = mesh, _active_mesh
+    if old is not None and mesh is not None:
+        old._flush_to_delete()
+    try:
+        with _dispatch():
+            yield
+    finally:
+        _active_mesh = old
