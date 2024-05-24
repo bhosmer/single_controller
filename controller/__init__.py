@@ -117,7 +117,7 @@ class DeviceMesh(Referenceable):
         # Optimize: we do not have to send device meshes to all workers if we can
         # Create process groups as subsets
         msg = worker.CreateDeviceMesh(self.ctrl.ref(), self.dims, [p.rank for p in self.processes])
-        self.ctrl.all_processes.send(msg)
+        self.processes.send(msg)
 
         return msg.result
 
@@ -165,7 +165,6 @@ class DeviceMesh(Referenceable):
         indices = [offset + sum(x) for x in itertools.product(*ranges)]
         processes = ProcessList(self.processes[x] for x in indices)
         return DeviceMesh(self.ctrl, processes, dims)
-
 
     def split(self, **kwargs: Dict[str, Tuple[str, ...]]):
         raise NotImplementedError()
@@ -304,14 +303,14 @@ class Tensor(Referenceable, BaseTensor):
        return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={self._fake})"
 
 
-    def to_mesh(self, mesh: DeviceMesh, stream: Optional[Stream]=None):
+    def to_mesh(self, mesh: DeviceMesh):
         """
         Move data between one device mesh and another. Sizes of named dimensions must match.
         If mesh has dimensions that self.mesh does not, it will broadcast to those dimensions.
 
 
         broadcast:
-            t.index_mesh(batch=0).to(t.mesh)
+            t.slice_mesh(batch=0).to_mesh(t.mesh)
 
         """
         raise NotImplementedError()
@@ -360,23 +359,22 @@ class Tensor(Referenceable, BaseTensor):
             ok because we eliminated the 'batch' dim via reduction.
         """
 
-    def index_mesh(self, **kwargs: Dict[str, Union[int, slice]]):
-        pass
-
-    def on_mesh(mesh: DeviceMesh) -> 'Tensor':
-        """
-        Create a new tensor where self.mesh is replaced with mesh.  Each device in self.mesh must be present exactly once in mesh.
-        The result ofo this operation is switches the device meshes, while leaving the local data on each device unchanged.
-
-        rotate:
-            t.to(t.mesh.batch.rotate(1)).on_mesh(t.mesh)
-
-        """
+    def slice_mesh(self, **kwargs: Dict[str, Union[int, slice]]) -> 'MeshSliceTensor':
         pass
 
     def delete_ref(self, ref: int):
         mesh = self.mesh
         mesh.ctrl.pending_del[mesh].append(ref)
+
+
+class MeshSliceTensor:
+    def __init__(self, tensor: 'Tensor', slicing):
+        self.tensor = tensor
+        self.slicing = slicing
+
+    def to_mesh(self, mesh: 'DeviceMesh') -> 'Tensor':
+        pass
+
 
 _explain = """\
 LOCAL_TENSOR

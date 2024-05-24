@@ -48,6 +48,30 @@ class Restarted(NamedTuple):
 def log(*args):
     logger.info(*args)
 
+
+class Dim(NamedTuple):
+    rank: int
+    size: int
+    process_group: Any
+
+class DeviceMesh:
+    def __init__(self, dims: Dict[str, int], ranks: List[int], index: int):
+        self.dims = {}
+        stride = 1
+        initial_index = index
+        objects = []
+        for size in reversed(dims.values()):
+            rank = index % size
+            index //= size
+            group_start = initial_index - rank*stride
+            members = ranks[group_start:group_start+stride*size:stride]
+            assert members[rank] == ranks[initial_index]
+            process_group = torch.distributed.new_group(members, use_local_synchronization=True)
+            objects.append(Dim(rank, size, process_group))
+            stride *= size
+        self.dims = dict(zip(dims.keys(), reversed(objects)))
+
+
 class Worker:
     def __init__(self, q: LocalMessageQueue, rank: int, world: int, local_rank: int):
         # remote ref id to local value
@@ -65,8 +89,8 @@ class Worker:
         raise RuntimeError(f"unhandled event: {event}")
 
     def CreateDeviceMesh(self, result: int, dims: Dict[str, int], ranks: List[int]):
-        if self.rank in ranks:
-            self.define(result, ('devicemesh', dims, ranks))
+        index = self.ranks.index(self.rank)
+        self.define(result, DeviceMesh(dims, ranks, index))
 
     def lookup(self, a: Any):
         if isinstance(a, Ref):
