@@ -18,6 +18,7 @@ import zmq
 from supervisor import HEARTBEAT_INTERVAL, HEARTBEAT_LIVENESS, ProcessFailedToStart
 from supervisor.logging import gethostname, initialize_logging
 import uuid
+from string import Template
 
 logger: logging.Logger = logging.getLogger(__name__)
 ABORT_INTERVAL = 5
@@ -53,15 +54,21 @@ class Process:
     ) -> None:
         self.proc_id = proc_id
         self.proc_comm = proc_comm
+        local_config = {
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": str(rank % processes_per_host),
+            "LOCAL_WORLD_SIZE": str(processes_per_host),
+            "SUPERVISOR_PIPE": proc_addr,
+            "SUPERVISOR_IDENT": str(proc_id),
+        }
+
         environ = dict(os.environ)
         if popen["env"] is not None:
-            environ.update(popen["env"])
-        environ["RANK"] = str(rank)
-        environ["WORLD_SIZE"] = str(world_size)
-        environ["LOCAL_RANK"] = str(rank % processes_per_host)
-        environ["LOCAL_WORLD_SIZE"] = str(processes_per_host)
-        environ["SUPERVISOR_PIPE"] = proc_addr
-        environ["SUPERVISOR_IDENT"] = str(proc_id)
+            # pyre-ignore
+            environ.update({k: Template(v).safe_substitute(local_config) for k, v in popen["env"].items()})
+        environ.update(local_config)
+
         popen = {**popen, "env": environ}
         try:
             if logfilename is None:

@@ -9,6 +9,7 @@ import importlib
 import logging
 from .tree import flatten, tree_map
 import torch
+import torch.distributed
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +73,37 @@ class DeviceMesh:
         self.dims = dict(zip(dims.keys(), reversed(objects)))
 
 
+def _reduce(local_tensor, source_mesh: 'DeviceMesh', dim: str, reduction: str, scatter: bool, destination_mesh: 'DeviceMesh', inplace: bool):
+    if destination_mesh is None:
+        destination_mesh = source_mesh
+    group = source_mesh.dims[dim].process_group
+
+    if reduction == 'stack':
+        output = torch.empty([source_mesh.dims[dim].size, *local_tensor.shape],
+                             dtype=local_tensor.dtype, device=local_tensor.device, layout=local_tensor.layout)
+        print(output.shape, local_tensor.shape)
+        torch.distributed.all_gather_into_tensor(output, local_tensor, group=group)
+        return output
+
+    output = local_tensor
+    if not inplace:
+        output = local_tensor.clone()
+
+    assert source_mesh is destination_mesh
+    assert not scatter
+    op = getattr(torch.distributed.ReduceOp, reduction.upper())
+    torch.distributed.all_reduce(output, op=op, group=group)
+    return output
+
+def _rank(mesh: 'DeviceMesh', dim: str):
+    return torch.full((), mesh.dims[dim].rank, dtype=torch.long)
+
 class Worker:
-    def __init__(self, q: LocalMessageQueue, rank: int, world: int, local_rank: int):
+    def __init__(self, q: LocalMessageQueue, store, rank: int, world: int, local_rank: int):
         # remote ref id to local value
         self.env: Dict[int, Any] = {}
         self.q = q
+        self.store = store
         self.rank = rank
         self.world = world
         self.local_rank = local_rank
@@ -89,7 +116,7 @@ class Worker:
         raise RuntimeError(f"unhandled event: {event}")
 
     def CreateDeviceMesh(self, result: int, dims: Dict[str, int], ranks: List[int]):
-        index = self.ranks.index(self.rank)
+        index = ranks.index(self.rank)
         self.define(result, DeviceMesh(dims, ranks, index))
 
     def lookup(self, a: Any):
@@ -120,7 +147,7 @@ class Worker:
     def Exit(self):
         raise StopIteration()
 
-    def CommandGroup(self, commands: List[NamedTuple], deletes: List[int]):
+    def CommandGroup(self, commands: List[NamedTuple]):
         for cmd in commands:
             self.handle_message(cmd)
 
@@ -143,13 +170,15 @@ class Worker:
 
 def worker_main(_restartable):
     rank = int(os.environ['RANK'])
-    initialize_logging(process_name=f'worker_{rank}')
-    logger.info("starting, restartable=%s", _restartable)
-    q = get_message_queue()
     world = int(os.environ['WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
+    initialize_logging(process_name=f'worker_{rank}')
+    logger.info("starting, restartable=%s", _restartable)
+    store = torch.distributed.TCPStore(os.environ['STORE_HOSTNAME'], int(os.environ['STORE_PORT']))
+    torch.distributed.init_process_group(backend='nccl', world_size=world, rank=rank, store=store)
+    q = get_message_queue()
     # CUDA_VISIBLE_DEVICES should be set on launch to LOCAL_RANK
-    worker = Worker(q, rank, world, local_rank)
+    worker = Worker(q, store, rank, world, local_rank)
     worker.event_loop()
     while _restartable:
         q.send(Restarted(0))

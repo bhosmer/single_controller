@@ -1,8 +1,10 @@
 from torch import device
 from torch.types import Device
-from supervisor import ProcessExited, ProcessList, Context, Host, FunctionCall
+from supervisor import ProcessExited, ProcessList, Context, Host, FunctionCall, host
 from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple, Callable
 from torch.utils._python_dispatch import TorchDispatchMode
+
+from supervisor.logging import gethostname
 from .tree import flatten, tree_map
 from torch._subclasses.fake_tensor import FakeTensorMode
 from .base_tensor import BaseTensor
@@ -19,6 +21,7 @@ from .worker import Ref
 from abc import ABC, abstractmethod
 from collections import defaultdict
 import itertools
+import socket
 
 check_correctness_per_operator = False
 if check_correctness_per_operator:
@@ -37,10 +40,11 @@ else:
     fake_mode = FakeTensorMode()
 
 class _Controller:
-    def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
+    def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None, _store=None):
         self.ctx = ctx
         self.hosts = hosts
-        self.all_processes = self._create_pg(ctx, hosts, gpu_per_host) if _processes is None else _processes
+        self.store = self._create_store() if _store is None else _store
+        self.all_processes = self._create_pg(ctx, hosts, gpu_per_host, self.store) if _processes is None else _processes
         self.next_ref = 0
         self.exited = {}
         self.pending_del: Dict[DeviceMesh, List[int]] = defaultdict(list)
@@ -49,12 +53,23 @@ class _Controller:
         _active_stream = Stream("main")
 
     @staticmethod
-    def _create_pg(ctx: Context, hosts: List[Host], gpu_per_host: int, _restartable=False):
+    def _create_store():
+        hostname = socket.gethostname()
+        with socket.socket() as sock:
+            sock.bind(('', 0))
+            port = sock.getsockname()[1]
+        return torch.distributed.TCPStore(hostname, port, is_master=True)
+
+    @staticmethod
+    def _create_pg(ctx: Context, hosts: List[Host], gpu_per_host: int, store,
+                   _restartable=False):
         return ctx.create_process_group(hosts,
                                         FunctionCall('controller.worker.worker_main',
                                                      _restartable=_restartable),
                                         processes_per_host=gpu_per_host,
-                                        env={'CUDA_VISIBLE_DEVICES': '$LOCAL_RANK'})
+                                        env={'CUDA_VISIBLE_DEVICES': '$LOCAL_RANK',
+                                             'STORE_HOSTNAME': store.host,
+                                             'STORE_PORT': str(store.port),})
 
     def shutdown(self):
         self._shutdown = True
@@ -99,6 +114,9 @@ class Referenceable:
     def __del__(self):
         if self.ref is not None:
             self.delete_ref(self.ref)
+
+def remote_function(path: str):
+    return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active_mesh, _active_stream, func)
 
 PyTree = Union[Dict[str, 'PyTree'], List['PyTree'], Tuple['PyTree',...], 'Tensor']
 
@@ -172,14 +190,21 @@ class DeviceMesh(Referenceable):
     def rotate(self, **kwargs: Dict[str, int]):
         raise NotImplementedError()
 
-class RemoteFunction:
-    def __init__(self, func: str, result: Optional[Callable]=None):
-        self.func = func
-        self.result = result
+    @remote_function('controller.worker._rank')
+    def rank(self, dim: str):
+        if dim not in self.dims:
+            raise KeyError(f'{self} does not have dimension {repr(dim)}')
+        return torch.full((), 0, dtype=torch.long)
 
-    def __call__(self, *args, **kwargs):
-        return dtensor_dispatch(self.func, args, kwargs, _active_mesh, _active_stream, self.result)
-
+@remote_function('controller.worker._reduce')
+def _reduce(tensor, source_mesh, dim, reduction, scatter, destination_mesh, inplace):
+    if inplace:
+        return tensor
+    else:
+        if reduction == 'gather':
+            return torch.empty([source_mesh.dims[dim], *tensor.shape],
+                               dtype=tensor.dtype, device=tensor.device, layout=tensor.layout)
+        return tensor.add(tensor)
 
 def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
     ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
@@ -257,6 +282,7 @@ class Pipe:
     def pop(self, sizes: Sequence[int], **kwargs: Unpack[TensorOptions]) -> 'Tensor':
         raise NotImplementedError()
 
+_valid_reduce = ['stack', 'sum', 'avg', 'product', 'min', 'max', 'band', 'bor', 'bxor']
 
 class Tensor(Referenceable, BaseTensor):
     stream: Stream
@@ -290,11 +316,7 @@ class Tensor(Referenceable, BaseTensor):
         else:
             function = func
 
-        def result_type(*args, **kwargs):
-            with fake_mode:
-                return func(*args, **kwargs)
-
-        return dtensor_dispatch(function, args, kwargs, _active_mesh, _active_stream, result_type)
+        return dtensor_dispatch(function, args, kwargs, _active_mesh, _active_stream, func)
 
     def __init__(self, fake: torch.Tensor, mesh: DeviceMesh, stream: Stream):
         pass
@@ -315,7 +337,14 @@ class Tensor(Referenceable, BaseTensor):
         """
         raise NotImplementedError()
 
-    def reduce(self, dim: str, reduction: Literal["gather", "sum", "max"], scatter=False, mesh=None):
+    def reduce_(self, dim: str, reduction: Literal["gather", "sum", "max"], scatter=False, mesh=None):
+        # TODO: checks that this can actually happen in place e.g. if scatter is True, operation must be gather.
+        inplace_valid = (reduction == 'gather' and scatter) or not scatter
+        if not inplace_valid:
+            raise ValueError(f'reduction {reduction} is not valid for in-place operation')
+        return self.reduce(dim, reduction, scatter, mesh, _inplace=True)
+
+    def reduce(self, dim: str, reduction: Literal["gather", "sum", "max"], scatter=False, mesh=None, _inplace=False):
         """
         Perform a reduction operation along dim, and move the data to mesh. If mesh=None, then mesh=self.mesh
         'gather' will concat the values along dim, and produce a local result tensor with an addition outer dimension of len(dim).
@@ -358,6 +387,15 @@ class Tensor(Referenceable, BaseTensor):
             First reduces dim 'batch' and then places it on the first rank. t.mesh.batch[0] doesn't have a 'batch' dimension, but this is
             ok because we eliminated the 'batch' dim via reduction.
         """
+        if scatter or mesh is not None:
+            raise NotImplementedError()
+        if dim not in self.mesh.dims:
+            raise KeyError(f'dim {dim} not found in {self.mesh}')
+        if reduction not in _valid_reduce:
+            raise ValueError(f'reduction {reduction} not supported, reductions are {_valid_reduce}')
+        if mesh is None:
+            mesh = self.mesh
+        return _reduce(self, self.mesh, dim, reduction, scatter, mesh, _inplace)
 
     def slice_mesh(self, **kwargs: Dict[str, Union[int, slice]]) -> 'MeshSliceTensor':
         pass
@@ -433,7 +471,8 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
     if callable(result_type):
         fake_input_tensors = [d._fake for d in dtensors]
         fake_args, fake_kwargs = unflatten(fake_input_tensors)
-        result = result_type(*fake_args, **fake_kwargs)
+        with fake_mode, active_mesh(None):
+            result = result_type(*fake_args, **fake_kwargs)
         fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
     else:
         result = result_type

@@ -1,0 +1,246 @@
+from collections import defaultdict
+from supervisor import Context, HostConnected
+from supervisor.host import Host as HostManager
+from controller import world_mesh, active_mesh, _Controller, DeviceMesh, remote_function
+from contextlib import contextmanager, ExitStack
+from threading import Thread
+from functools import cache, partial
+from unittest import main, TestCase
+from time import sleep
+import torch
+import signal
+from unittest.mock import patch
+
+@remote_function('controller.worker.log')
+def log(*args):
+    pass
+
+@remote_function('builtins.list')
+def rlist(elem):
+    return elem
+
+@contextmanager
+def _get_context(N, gpu_per_host):
+    ctx = Context()
+    ctx.request_hosts(N)
+    threads = []
+    # we want ctx to start its listener threads
+    # before creating the hosts because
+    # initialization will happen faster in this case
+    sleep(0)
+
+    def run_host(host: HostManager):
+        try:
+            host.run_event_loop_forever()
+        except SystemExit:
+            pass
+
+    for _ in range(N):
+        host = HostManager("tcp://127.0.0.1:55555")
+        thread = Thread(target=partial(run_host, host))
+        thread.start()
+        threads.append(thread)
+
+    connections = ctx.messagefilter(HostConnected)
+    hosts = [connections.recv(timeout=1).sender for _ in range(N)]
+    store = _Controller._create_store()
+    processes = _Controller._create_pg(ctx, hosts, gpu_per_host, store, _restartable=True)
+    yield ctx, hosts, processes
+    for p in processes:
+        p.signal(signal.SIGTERM)
+    ctx.shutdown()
+    for th in threads:
+        th.join(timeout=1)
+        if th.is_alive():
+            raise TimeoutError()
+
+
+class TestController(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cleanup = ExitStack()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cleanup.close()
+
+    @classmethod
+    @cache
+    def _processes(cls, N, gpu_per_host):
+        return cls.cleanup.enter_context(_get_context(N, gpu_per_host))
+
+    @classmethod
+    @contextmanager
+    def local_device_mesh(cls, N, gpu_per_host, activate=True):
+        ctx, hosts, processes = cls._processes(N, gpu_per_host)
+        dm = world_mesh(ctx, hosts, gpu_per_host, _processes=processes)
+        if activate:
+            with active_mesh(dm):
+                yield dm
+        else:
+            yield dm
+        dm.ctrl.shutdown()
+
+    def test_hello(self):
+        with self.local_device_mesh(2, 2) as device_mesh:
+            log(device_mesh)
+
+    def test_simple_tensors(self):
+        with self.local_device_mesh(2, 2) as device_mesh:
+            x = torch.rand(3, 4)
+            y = x + x
+            log("%s %s", x, y)
+            z = torch.std_mean(x)
+            log("%s", z)
+
+    def test_errors(self):
+        t = torch.rand(3, 4)
+        with self.local_device_mesh(2, 2) as device_mesh:
+            y = torch.rand(3, 4)
+            with self.assertRaisesRegex(TypeError, 'LOCAL_TENSOR'):
+                t.add(y)
+            with self.assertRaisesRegex(TypeError, 'WRONG_MESH'):
+                sm = device_mesh(host=0)
+                with active_mesh(sm):
+                    x = torch.rand(3, 4)
+                    x.add(y)
+
+    def test_mesh_index(self):
+        fake_processes = tuple(range(0, 2*3*4))
+        dm = DeviceMesh(None, fake_processes, {'a': 2, 'b': 3, 'c': 4})
+        self.assertEqual(0, dm(a=0, b=0, c=0).processes[0])
+        x = dm(a=0, b=0)
+        self.assertEqual(x.processes, fake_processes[0:4])
+        self.assertEqual(x.dims, {'c': 4})
+        x = dm(c=slice(None, None, 2))
+        self.assertEqual(x.processes, fake_processes[::2])
+        x = dm(b=2, c=3)
+        self.assertEqual(x.processes, (11, 23))
+
+    def test_sub_mesh(self):
+        with self.local_device_mesh(2, 2) as device_mesh:
+            h0 = device_mesh(host=0)
+            h1 = device_mesh(host=1)
+            with active_mesh(h0):
+                x = torch.rand(3, 4)
+                log('x: %s', x)
+            with active_mesh(h1):
+                y = torch.rand(3, 4)
+                log('y: %s', y)
+                with self.assertRaisesRegex(TypeError, 'WRONG_MESH'):
+                    log("x: %s", x)
+
+
+    def test_user_call(self):
+        with self.local_device_mesh(2, 2) as device_mesh:
+            x = torch.rand(3, 4)
+            y = rlist((x + 1, x))
+            log("%s", y)
+
+            # resume monday:
+            # 1. tensor ctor resource guard (done)
+            # 2. __torch_dispatch__ forward of normal ops (done)
+            # 3. collectives created for device mesh
+            # 4. implement comms APIs
+            # 5. transfer tensor back, and simple future to wait for result.
+
+    @patch('torch.distributed.new_group', new=lambda ranks, use_local_synchronization: ranks)
+    def test_worker_mesh_init(self):
+        from controller.worker import DeviceMesh as WorkerDeviceMesh
+        wdm = WorkerDeviceMesh({'a': 3, 'b': 4}, ranks=list(range(3*4)), index=1)
+        a, b = wdm.dims['a'], wdm.dims['b']
+        self.assertEqual(b.process_group, [0, 1, 2, 3])
+        self.assertEqual(b.rank, 1)
+
+        self.assertEqual(a.process_group, [1, 5, 9])
+        self.assertEqual(a.rank, 0)
+
+
+        wdm = WorkerDeviceMesh({'a': 3, 'b': 4}, ranks=list(range(3*4)), index=6)
+        a, b = wdm.dims['a'], wdm.dims['b']
+        self.assertEqual(b.process_group, [4, 5, 6, 7])
+        self.assertEqual(b.rank, 2)
+        self.assertEqual(a.process_group, [2, 6, 10])
+        self.assertEqual(a.rank, 1)
+
+        wdm = WorkerDeviceMesh({'a': 3, 'b': 4, 'c': 2}, ranks=list(range(3*4*2)), index=10)
+        print(wdm.dims)
+
+    def test_reduce(self):
+
+        with self.local_device_mesh(2, 2) as device_mesh:
+            x = 12*2*device_mesh.rank('host') + 12*device_mesh.rank('gpu') + torch.arange(12).reshape(3, 4)
+            x = x.cuda()
+            y = x.reduce('gpu', 'sum')
+            g = x.reduce('gpu', 'stack')
+            log("%s %s %s", x, y, g)
+
+
+
+    def test_simple_examples(self):
+        # `local_device_mesh` is just a helper for testing
+        # that sets up the worker processes/host managers/etc.
+        # locally. For 'real' programs the initial device_mesh
+        # will be provided at program start.
+        with self.local_device_mesh(2, 2, activate=False) as device_mesh:
+
+            print(device_mesh)
+            # <DeviceMesh(('host', 'gpu'), (2, 2)) at 0x7fa6175b3bb0>
+            h0 = device_mesh(host=0)
+            h1 = device_mesh(host=1)
+
+
+            # Device Meshes are multi-dimension lists with named
+            # dimensions. On startup they will initially have a host and gpu dimension.
+
+
+            # When there is no active device mesh, compute is local
+            t = torch.rand(1)
+            print(t)
+            # tensor([0.6893])
+
+            # now _all_ compute is done on the device mesh within this context
+            with active_mesh(device_mesh):
+                x = torch.rand(3, 4)
+                y = x + x
+                print(y)
+                # DTensor(mesh=..., stream=<Stream('main') at 0x7f79451b3c10>, fake=FakeTensor(..., size=(3, 4)))
+                with self.assertRaisesRegex(TypeError, 'LOCAL_TENSOR'):
+                    z = y.add(t)
+                    """
+                    TypeError: Mismatched arguments to distributed tensor operation:
+
+                    torch.ops.aten.add.Tensor(., LOCAL_TENSOR)
+
+                    active_mesh = <DeviceMesh(('host', 'gpu'), (2, 2)) at 0x7f1a468bbe20>
+                    active_stream = <Stream('main') at 0x7f1a468bbd30>
+                    LOCAL_TENSOR: A local (non-distributed) tensor is being passed while a device_mesh is active.
+                    If you want to do local tensor compute use `with active_mesh(None):`
+                    """
+                # we can use helper functions to get the worker machines to log tensor info they have
+                log("Y: %s", y)
+                # worker_0: Y: tensor([[0.7125, 0.9058, 0.8245, 0.7008],
+                # worker_0:         [1.3899, 0.9606, 0.4697, 1.9011],
+                # worker_0:         [1.7506, 1.9513, 0.5936, 1.2739]])
+                # worker_3: Y: tensor([[1.1647, 1.8845, 1.7686, 0.2304],
+                # worker_3:         [0.4569, 0.9294, 0.0358, 0.8630],
+                # worker_3:         [1.3946, 1.3274, 1.1046, 0.3136]])
+
+                # log isn't special, it is just a remote function call.
+                #  Note how we use strings to name functions on the controller.
+                #  This is so the controller doesn't have to load modules
+                #  That might only be installed on the workers, or cannot work
+                #  without initializing a cuda context.
+                #     log = RemoteFunction('controller.worker.log')
+
+                # If you have a remote function that returns tensors, then you can
+                # specify a type propagation function when creating it.
+
+                #
+
+
+
+
+
+if __name__ == "__main__":
+    main()
