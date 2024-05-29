@@ -1,6 +1,6 @@
 from torch import device
 from torch.types import Device
-from supervisor import ProcessExited, ProcessList, Context, Host, FunctionCall, host
+from supervisor import ProcessList, Context, Host, FunctionCall, TTL
 from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple, Callable
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -17,11 +17,15 @@ from contextlib import contextmanager
 import math
 import os
 from . import worker
-from .worker import Ref
+from .worker import RemoteException, Ref
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 import itertools
 import socket
+import logging
+import traceback
+
+logger = logging.getLogger(__name__)
 
 check_correctness_per_operator = False
 if check_correctness_per_operator:
@@ -39,16 +43,25 @@ if check_correctness_per_operator:
 else:
     fake_mode = FakeTensorMode()
 
+_CONTROLLER_STATUS_INTERVAL = 2
+
 class _Controller:
     def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None, _store=None):
         self.ctx = ctx
         self.hosts = hosts
         self.store = self._create_store() if _store is None else _store
         self.all_processes = self._create_pg(ctx, hosts, gpu_per_host, self.store) if _processes is None else _processes
-        self.next_ref = 0
+        self.last_completed_idents = [-1 for _ in self.all_processes]
+        self.min_last_completed_ident = -1
+        self.next_ref = itertools.count()
+        self.next_ident = itertools.count()
         self.exited = {}
+        self.failures: Dict[int, Dict[int, RemoteException]] = defaultdict(dict)
+        self.tracebacks: deque[List[traceback.FrameSummary]] = deque()
         self.pending_del: Dict[DeviceMesh, List[int]] = defaultdict(list)
         self._shutdown = False
+        self.incomplete_futures = {}
+        self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
         global _active_stream
         _active_stream = Stream("main")
 
@@ -75,16 +88,14 @@ class _Controller:
         self._shutdown = True
         self.all_processes.send(worker.Exit())
         while len(self.exited) < len(self.all_processes):
-            self._process_event()
-
-    def _process_event(self):
-        sender, event = self.ctx.recv()
-        if isinstance(event, (ProcessExited, worker.Restarted)):
-            self.exited[sender] = event.result
+            self._read_messages(None)
 
     def ref(self) -> int:
-        r = self.next_ref
-        self.next_ref += 1
+        return next(self.next_ref)
+
+    def ident(self) -> int:
+        r = next(self.next_ident)
+        self.tracebacks.append(traceback.extract_stack())
         return r
 
     def _flush_deletes(self, device_mesh: 'DeviceMesh') -> Optional[worker.DeleteRefs]:
@@ -98,6 +109,48 @@ class _Controller:
         self.pending_del.clear()
         return to_delete
 
+    def _read_messages(self, timeout: Optional[float]):
+        if self.controller_status_ttl() == 0:
+            self.all_processes.send(worker.ControllerStatus(self.ident()))
+            self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
+        for msg in self.ctx.recvready(timeout):
+            self.handle_message(msg)
+
+    def future(self):
+        ident = self.ident()
+        f = self.incomplete_futures[ident] = Future(self)
+        return f, ident
+
+    def handle_message(self, msg):
+        sender, value = msg
+        getattr(self, value.__class__.__name__)(sender, *value)
+
+    def ProcessExited(self, proc, result):
+        self.exited[proc] = result
+
+    def Restarted(self, proc, result):
+        self.exited[proc] = result
+
+    def ValueResult(self, proc, ident, value):
+        self.incomplete_futures.pop(ident)._set_result(value)
+
+    def ValueException(self, proc, ident, failing_ident):
+        self.incomplete_futures[ident]._set_result(self.failures[failing_ident][proc.rank])
+
+    def Status(self, proc, last_completed_ident, failed_idents):
+        # record failure messages in status report for later reporting
+        for ident, (exception, worker_frames) in failed_idents.items():
+            frames = self.tracebacks[ident - (self.min_last_completed_ident + 1)]
+            self.failures[ident][proc.rank] = worker.RemoteException(exception, frames + worker_frames)
+
+        # advance what our last completed action was, and
+        # trim the list of tracebacks if we no longer need them.
+        prev = self.last_completed_idents[proc.rank]
+        self.last_completed_idents[proc.rank] = last_completed_ident
+        if prev == self.min_last_completed_ident:
+            self.min_last_completed_ident = min(self.last_completed_idents)
+            for _ in range(self.min_last_completed_ident - prev):
+                self.tracebacks.popleft()
 
 class Referenceable:
     def delete_ref(self, ref):
@@ -117,6 +170,21 @@ class Referenceable:
 
 def remote_function(path: str):
     return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active_mesh, _active_stream, func)
+
+def _ident(*args):
+    return args
+
+def remote_value(path: str):
+    def wrapper(**mesh_coordinates: int):
+        return lambda *args, **kwargs: _dispatch_remote_value(path, mesh_coordinates, args, kwargs)
+
+def _dispatch_remote_value(path: str, mesh_coordinates: Dict[str, int], args: Tuple[Any, ...], kwargs: Dict[str, Any]):
+    if _active_mesh is None:
+        raise ValueError('No device mesh is active')
+    fut, ident = _active_mesh.ctrl.future()
+    process = _active_mesh._process(mesh_coordinates)
+    process.send(worker.RemoteValue(ident, path, args, kwargs))
+    return fut
 
 PyTree = Union[Dict[str, 'PyTree'], List['PyTree'], Tuple['PyTree',...], 'Tensor']
 
@@ -196,12 +264,37 @@ class DeviceMesh(Referenceable):
             raise KeyError(f'{self} does not have dimension {repr(dim)}')
         return torch.full((), 0, dtype=torch.long)
 
+    def _process(self, mesh_coordinates: Dict[str, int]):
+        stride = 1
+        offset = 0
+        extra = set(mesh_coordinates.keys()) - set(self.dims.keys())
+        if extra:
+            raise KeyError(f'{list(extra)}')
+        for dim, size in reversed(self.dims.items()):
+            idx = mesh_coordinates.get(dim, 0)
+            if idx < 0:
+                idx += size
+            if idx < 0 or idx >= size:
+                raise IndexError(f'{dim} of size {size} has index {idx} out of range')
+            offset += stride*idx
+            stride *= size
+        return self.processes[offset]
+
+
+
 @remote_function('controller.worker._reduce')
 def _reduce(tensor, source_mesh, dim, reduction, scatter, destination_mesh, inplace):
-    if inplace:
-        return tensor
+    if scatter:
+        N = source_mesh.dims[dim]
+        if tensor.ndim == 0 or tensor.size(0) != N:
+            raise TypeError(f'When scattering results the outer most dimension of tensor ({list(tensor.size())} must match the size ({N}) of the dimension "{dim}" being reduced')
+        if reduction == 'stack':
+            # scatter removes a dimension of mesh size
+            # but gather adds the dimension back
+            return tensor
+        return tensor.sum(dim=0)
     else:
-        if reduction == 'gather':
+        if reduction == 'stack':
             return torch.empty([source_mesh.dims[dim], *tensor.shape],
                                dtype=tensor.dtype, device=tensor.device, layout=tensor.layout)
         return tensor.add(tensor)
@@ -341,7 +434,7 @@ class Tensor(Referenceable, BaseTensor):
         # TODO: checks that this can actually happen in place e.g. if scatter is True, operation must be gather.
         inplace_valid = (reduction == 'gather' and scatter) or not scatter
         if not inplace_valid:
-            raise ValueError(f'reduction {reduction} is not valid for in-place operation')
+            raise ValueError(f'reduction {reduction} is not valid for in-place operation because the output size will not match the input size')
         return self.reduce(dim, reduction, scatter, mesh, _inplace=True)
 
     def reduce(self, dim: str, reduction: Literal["gather", "sum", "max"], scatter=False, mesh=None, _inplace=False):
@@ -387,7 +480,7 @@ class Tensor(Referenceable, BaseTensor):
             First reduces dim 'batch' and then places it on the first rank. t.mesh.batch[0] doesn't have a 'batch' dimension, but this is
             ok because we eliminated the 'batch' dim via reduction.
         """
-        if scatter or mesh is not None:
+        if mesh is not None:
             raise NotImplementedError()
         if dim not in self.mesh.dims:
             raise KeyError(f'dim {dim} not found in {self.mesh}')
@@ -483,7 +576,7 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
     # sometimes operators return references to inputs, in which case the result should be the same DTensor object
     # otherwise we create a new DTensor with a new RemoteRef for the result
     result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream) for fake in fake_result_dtensors)
-    device_mesh._send(worker.CallFunction(tuple(r.ref for r in result_dtensors), func, args, kwargs))
+    device_mesh._send(worker.CallFunction(device_mesh.ctrl.ident(), tuple(r.ref for r in result_dtensors), func, args, kwargs))
     results = unflatten_result(result_dtensors)
     return results
 
@@ -533,3 +626,60 @@ def active_mesh(mesh: Optional[DeviceMesh]):
             yield
     finally:
         _active_mesh = old
+
+class Future:
+    def __init__(self, ctrl: '_Controller'):
+        self._ctrl = ctrl
+        self._status = 'incomplete'
+        self._callbacks = None
+        self._result = None
+
+    def _set_result(self, r):
+        assert self._status == 'incomplete'
+        self._result = r
+        self._status = 'exception' if isinstance(r, RemoteException) else 'complete'
+        if self._callbacks:
+            for cb in self._callbacks:
+                try:
+                    cb(self)
+                except Exception:
+                    logger.exception("exception in controller's Future callback")
+        self._callbacks = None
+        self._ctrl = None
+
+    def _wait(self, timeout: Optional[float]):
+        if self._status != 'incomplete':
+            return True
+        if timeout is None:
+            while self._status == 'incomplete':
+                self._ctrl._read_messages(timeout=None)
+        else:
+            ttl = TTL(timeout)
+            while self._status == 'incomplete':
+                remaining = ttl()
+                self._ctrl._read_messages(timeout=remaining)
+                if remaining == 0:
+                    return self._status != 'incomplete'
+        return True
+
+    def result(self, timeout: Optional[float]=None):
+        if not self._wait(timeout):
+            raise TimeoutError()
+        assert self._result is not None
+        if self._status == 'exception':
+            raise self._result
+        return self._result
+
+    def done(self) -> bool:
+        return self._wait(0)
+
+    def exception(self, timeout: Optional[float]=None):
+        if not self._wait(timeout):
+            raise TimeoutError()
+        return self._result if self._status == 'exception' else None
+
+    def add_callback(self, callback):
+        if not self._callbacks:
+            self._callbacks = [callback]
+        else:
+            self._callbacks.append(callback)

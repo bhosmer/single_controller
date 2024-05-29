@@ -1,7 +1,7 @@
 from collections import defaultdict
 from supervisor import Context, HostConnected
 from supervisor.host import Host as HostManager
-from controller import world_mesh, active_mesh, _Controller, DeviceMesh, remote_function
+from controller import world_mesh, active_mesh, _Controller, DeviceMesh, remote_function, Future, RemoteException
 from contextlib import contextmanager, ExitStack
 from threading import Thread
 from functools import cache, partial
@@ -173,9 +173,58 @@ class TestController(TestCase):
             x = x.cuda()
             y = x.reduce('gpu', 'sum')
             g = x.reduce('gpu', 'stack')
-            log("%s %s %s", x, y, g)
+            with self.assertRaisesRegex(TypeError, 'When scattering'):
+                x = x.reduce('gpu', 'sum', scatter=True)
+            x = x.reshape(2, 6)
+            atoa = x.reduce('gpu', 'stack', scatter=True)
+            rs = x.reduce('gpu', 'sum', scatter=True)
+            log("x: %s\ny:%s\ng:%s\natoa:%s\nrs:%s\n", x, y, g, atoa, rs)
 
+    def test_future(self):
+        the_time = 0
+        the_messages = []
+        class MockController:
+            def _read_messages(self, timeout):
+                nonlocal the_time
+                if not the_messages:
+                    return
+                time, action = the_messages[0]
+                if timeout is None or time <= the_time + timeout:
+                    the_time = time
+                    action()
+                    the_messages.pop(0)
+                else:
+                    the_time += timeout
 
+        ctrl = MockController()
+
+        def time():
+            return the_time
+
+        with patch('time.time', time):
+            f = Future(ctrl)
+            the_messages = [(1, lambda: f._set_result(4))]
+            self.assertTrue(not f.done())
+            with self.assertRaises(TimeoutError):
+                f.result(timeout=.5)
+            self.assertEqual(4, f.result(timeout=1))
+            self.assertIsNone(f.exception())
+            self.assertTrue(f.done())
+            f = Future(ctrl)
+            the_messages = [(1, lambda: None), (2, lambda: f._set_result(3))]
+            the_time = 0
+            self.assertEqual(3, f.result())
+            f = Future(ctrl)
+            re = RemoteException(Exception(), [])
+
+            the_messages = [(1, lambda: None), (2, lambda: f._set_result(re))]
+            the_time = 0
+            self.assertIsNotNone(f.exception())
+
+            f = Future(ctrl)
+            the_messages = [(0, lambda: None), (.2, lambda: f._set_result(7))]
+            the_time = 0
+            self.assertEqual(7, f.result(timeout=.3))
 
     def test_simple_examples(self):
         # `local_device_mesh` is just a helper for testing
