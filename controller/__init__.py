@@ -24,6 +24,7 @@ import itertools
 import socket
 import logging
 import traceback
+import warnings
 from weakref import WeakKeyDictionary, WeakSet
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,11 @@ else:
 
 _CONTROLLER_STATUS_INTERVAL = 2
 
+class _Borrow(NamedTuple):
+    id: int
+    used: bool
+    frames: List[traceback.FrameSummary]
+
 class _Borrows:
     def __init__(self, origin_stream: 'Stream'):
         self.origin_stream = origin_stream
@@ -54,7 +60,7 @@ class _Borrows:
         # what Tensor aliases exist for this storage
         self.aliases = WeakSet()
         # what active borrows of this exist?
-        self.active: Dict['Stream', Tuple[int, bool]] = {} # (borrow_id, has_been_used)
+        self.active: Dict['Stream', _Borrow] = {}
 
 class _Controller:
     def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None, _store=None):
@@ -310,10 +316,10 @@ class DeviceMesh(Referenceable):
     def _use(self, tensor):
         borrows = tensor._borrows
         if tensor.stream is not borrows.origin_stream:
-            id, used = borrows.active.pop(tensor.stream)
-            if not used:
-                self._send(worker.BorrowFirstUse(id))
-            borrows.active[tensor.stream] = (id, True)
+            borrow = borrows.active[tensor.stream]
+            if not borrow.used:
+                self._send(worker.BorrowFirstUse(borrow.id))
+                borrows.active[tensor.stream] = borrow._replace(used=True)
 
 
 @remote_function('controller.worker._reduce')
@@ -351,25 +357,14 @@ class Stream(Referenceable):
     def __repr__(self):
         return f'<Stream({repr(self.name)}) at {hex(id(self))}>'
 
+    def __str__(self):
+        return f'stream {repr(self.name)}'
+
     def _use_controller(self, ctrl: '_Controller'):
         if self.ctrl is None:
             self.ctrl = ctrl
         elif self.ctrl is not ctrl:
             raise TypeError('DeviceMesh and stream controller are different.')
-
-    def wait_for(self, other: 'Stream'):
-        """
-        Blocks execution of this stream until the other stream completes the work that has been scheduled.
-        Any tensors which have been borrowed from this stream to other, and then freed, will be returned
-        to this stream, reclaiming the memory if there are no other references to them.
-        """
-        if other.ctrl is None:
-            # nothing has happened yet on other stream, so we
-            # can return
-            return
-        self._use_controller(other.ctrl)
-
-        raise NotImplementedError()
 
     def delete_ref(self, ref):
         # streams are not frequently created/destroyed so
@@ -396,8 +391,9 @@ class Stream(Referenceable):
     def borrow(self, t: 'Tensor', mutable: bool = False) -> 'Tensor':
         """
         Borrows tensor 't' for use on this stream.
-        The memory of t will stay alive until the borrowed tensor is freed AND then self has waited
-        on t.stream, either because of another borrow or an call to `wait_for`.
+        The memory of t will stay alive until t.drop() is called, which will free t and
+        and any of its alises on stream `self` and will cause t.stream to wait on self at that point so
+        that the memory of t can be reused.
 
         If `mutable` then self can write to the storage of `t`, but t.stream cannot read or write `t` until,
         the borrow is returned (becomes free and a wait_for has been issued).
@@ -415,7 +411,7 @@ class Stream(Referenceable):
         assert r.ref is not None
         t.mesh._send(worker.BorrowCreate(r.ref, t, t.stream, self, already_borrowed))
         if not already_borrowed:
-            borrows.active[self] = (r.ref, False)
+            borrows.active[self] = _Borrow(r.ref, False, traceback.extract_stack())
             borrows.writing_stream = self if mutable else None
         return r
 
@@ -489,8 +485,8 @@ class Tensor(Referenceable, BaseTensor):
                 continue
             alias._drop_ref()
         if borrows.origin_stream is not self.stream:
-            id, _ = borrows.active.pop(self.stream)
-            self.mesh._send(worker.BorrowDrop(id))
+            borrow = borrows.active.pop(self.stream)
+            self.mesh._send(worker.BorrowDrop(borrow.id))
             if not borrows.active:
                 borrows.writing_stream = borrows.origin_stream
 
@@ -527,7 +523,7 @@ class Tensor(Referenceable, BaseTensor):
             t.slice_mesh(batch=0).to_mesh(t.mesh)
 
         """
-        raise NotImplementedError()
+        return MeshSliceTensor(self, self.mesh).to_mesh(mesh)
 
     def reduce_(self, dim: str, reduction: Literal["gather", "sum", "max"], scatter=False, mesh=None):
         # TODO: checks that this can actually happen in place e.g. if scatter is True, operation must be gather.
@@ -590,22 +586,56 @@ class Tensor(Referenceable, BaseTensor):
         return _reduce(self, self.mesh, dim, reduction, scatter, mesh, _inplace)
 
     def slice_mesh(self, **kwargs: Dict[str, Union[int, slice]]) -> 'MeshSliceTensor':
-        pass
+        # technically a slice of a device mesh and a device mesh are not same thing
+        # because a device mesh also has caches for doing collectives.
+        # but this is an easy way to create a MeshSliceTensor until we optimize
+        # how we represent mesh slices.
+        slicing = self.mesh(**kwargs)
+        return MeshSliceTensor(self, slicing)
 
     def delete_ref(self, ref: int):
         if self._borrowed:
-            raise ValueError('t.drop() must be called before a borrowed tensor is freed to specify when the borrowed tensor should return to its origin stream.')
+            current = ''.join(traceback.format_stack())
+            borrowtb = ''.join(traceback.format_list(self._borrows.active[self.stream].frames))
+            warnings.warn('t.drop() must be called before a borrowed tensor is freed to specify when the borrowed tensor should return to its origin stream, but this tensor is being deleted before drop.'
+                          't.drop() is being called automatically here to ensure correctness, but this will force a synchronization back to the original stream at this point which might not be intended.'
+                          f'\nTraceback of __del__(most recent call last):\n{current}\nTraceback of original borrow (most recent call last):{borrowtb}')
+            self.drop()
+            return
         mesh = self.mesh
         mesh.ctrl.pending_del[mesh].append(ref)
 
 
 class MeshSliceTensor:
-    def __init__(self, tensor: 'Tensor', slicing):
+    def __init__(self, tensor: 'Tensor', slicing: 'DeviceMesh'):
         self.tensor = tensor
         self.slicing = slicing
 
     def to_mesh(self, mesh: 'DeviceMesh') -> 'Tensor':
-        pass
+        if self.slicing.dims != mesh.dims:
+            raise ValueError(f'input of dimensions {self.slicing.dims} does not match destination mesh of dimensions {mesh.dims}')
+
+        # XXX - this is a very ineffiecient algorithm for figuring out which groups need messages. With O(Workers)
+        # individual sends. The message size is also O(Workers).
+        # An O(Workers) algorithm can easily send O(1) individual messages
+        # but this is suppose to be a stub for an optimized algorithm where:
+        # 1. We can represent submeshes as NDSlice(offet, sizes, strides) on rank.
+        # 2. A message can be efficiently broadcast to List[NDSlice] ranks by a smart tree based algorithm that can
+        #    figure out which subtrees need the message.
+        # 3. The message itself will use List[NDSlice] objects to express the send/recv set and so it is very small
+
+        # so basically both the way the messsage is broadcast and its size will be compressed but the
+        # send pattern and the meaning of the message will be the same as this ineffiecient form
+
+        combined_processes = self.slicing.processes
+        if self.slicing.processes is not mesh.processes:
+            combined_processes = ProcessList(sorted(set(self.slicing.processes).union(mesh.processes)))
+
+        from_ranks = [p.rank for p in self.slicing.processes]
+        to_ranks = [p.rank for p in mesh.processes]
+        r = Tensor(self.tensor._fake, mesh, _active_stream, False)
+        combined_processes.send(worker.SendTensor(r, from_ranks, to_ranks, self.tensor, self.tensor.stream))
+
 
 
 _explain = """\
@@ -675,11 +705,13 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
         result = ctrl._run_fake(result_type, fake_args, fake_kwargs)
         for i in range(len(dtensors)):
             if before_versions[i] < fake_input_tensors[i]._version:
-                writing_stream = dtensors[i]._borrows.writing_stream
+                borrows = dtensors[i]._borrows
+                writing_stream = borrows.writing_stream
                 if writing_stream is not stream:
                     reason = "it is read only because it is being borrowed" if writing_stream is None \
                              else f"it can only be mutated by f{writing_stream}"
-                    raise ValueError(f"Tensor input {i} would be mutated by this operator but {reason}")
+                    tbs = ''.join(f"Traceback of borrow to {k} (most recent frame last):\n{''.join(traceback.format_list(b.frames))}" for k,b in borrows.active.items())
+                    raise ValueError(f"\n{tbs}\nTensor input {i} would be mutated by this operator but {reason}")
         fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
     else:
         result = result_type

@@ -118,6 +118,27 @@ class BorrowDrop(NamedTuple):
 class BorrowFirstUse(NamedTuple):
     borrow: int
 
+class SendTensor(NamedTuple):
+    result: int
+    from_ranks: List[int]
+    to_ranks: List[int]
+    tensor: Any
+    factory: 'TensorFactory'
+    stream: Any
+
+class TensorFactory(NamedTuple):
+    size: Tuple[int,...]
+    dtype: torch.dtype
+    layout: torch.layout
+    device: torch.device
+    memory_format: torch.memory_format
+
+    def empty(self):
+        return torch.empty(self.size, dtype=self.dtype, layout=self.layout, device=self.device, memory_format=self.memory_format)
+
+    def zeros(self):
+        return torch.full(self.size, 0, dtype=self.dtype, layout=self.layout, device=self.device, memory_format=self.memory_format)
+
 class DeviceMesh:
     def __init__(self, dims: Dict[str, int], ranks: List[int], index: int):
         self.dims = {}
@@ -354,6 +375,43 @@ class Worker:
 
     def BorrowDrop(self, borrow: int):
         self.borrows.pop(borrow).drop()
+
+    def SendTensor(self, result: int, from_ranks: List[int], to_ranks: List[int], tensorref: Ref, factory: TensorFactory, streamref):
+        try:
+            stream = self.lookup(streamref)
+        except DependentOnError as e:
+            self.define(result, e)
+            return
+        with stream:
+            ops = []
+            P2POp = torch.distributed.P2POp
+            isend, irecv = torch.distributed.isend, torch.distributed.irecv
+            try:
+                try:
+                    tensor = self.lookup(tensorref)
+                except DependentOnError:
+                    # XXX - how do we propagate this error on the host correctly?
+                    # the host will see on status, but it will not immediately know
+                    # what dependended on this downstream that also has to be invalid now.
+                    tensor = factory.zeros()
+
+                index = from_ranks.index(self.rank)
+                to_rank = to_ranks[index]
+                ops.append(P2POp(isend, tensor, to_rank))
+            except ValueError:
+                pass
+
+            try:
+                index = to_ranks.index(self.rank)
+                from_rank = from_ranks[index]
+                recv = factory.empty()
+                ops.append(P2POp(irecv, recv, from_rank))
+                self.define(result, recv)
+            except ValueError:
+                pass
+            # invoke batched p2p ops
+            for op in torch.distributed.batch_isend_irecv(ops):
+                op.wait()
 
     def define(self, r: int, value: Any):
         self.env[r] = value

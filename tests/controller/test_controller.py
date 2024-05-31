@@ -275,7 +275,8 @@ class TestController(TestCase):
             b = s.borrow(x, mutable=True)
             with active_stream(s):
                 b.abs_()
-            b.drop()
+            # b.drop()
+            del b
             x.abs_()
 
 
