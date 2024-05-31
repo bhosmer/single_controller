@@ -3,7 +3,7 @@ from torch.types import Device
 from supervisor import ProcessList, Context, Host, FunctionCall, TTL
 from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple, Callable
 from torch.utils._python_dispatch import TorchDispatchMode
-
+from concurrent.futures import ThreadPoolExecutor
 from supervisor.logging import gethostname
 from .tree import flatten, tree_map
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -24,6 +24,7 @@ import itertools
 import socket
 import logging
 import traceback
+from weakref import WeakKeyDictionary, WeakSet
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,16 @@ else:
 
 _CONTROLLER_STATUS_INTERVAL = 2
 
+class _Borrows:
+    def __init__(self, origin_stream: 'Stream'):
+        self.origin_stream = origin_stream
+        # who can write to this storage?
+        self.writing_stream: Optional[Stream] = origin_stream
+        # what Tensor aliases exist for this storage
+        self.aliases = WeakSet()
+        # what active borrows of this exist?
+        self.active: Dict['Stream', Tuple[int, bool]] = {} # (borrow_id, has_been_used)
+
 class _Controller:
     def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None, _store=None):
         self.ctx = ctx
@@ -62,8 +73,16 @@ class _Controller:
         self._shutdown = False
         self.incomplete_futures = {}
         self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
+        self.allocation_borrows: WeakKeyDictionary[torch.UntypedStorage, _Borrows] = WeakKeyDictionary()
+        self.fake_mode_worker = ThreadPoolExecutor(max_workers=1)
         global _active_stream
-        _active_stream = Stream("main")
+        _active_stream = Stream("main", _default=True)
+
+    def _run_fake(self, func, args, kwargs):
+        def work():
+            with fake_mode:
+                return func(*args, **kwargs)
+        return self.fake_mode_worker.submit(work).result()
 
     @staticmethod
     def _create_store():
@@ -88,14 +107,14 @@ class _Controller:
         self._shutdown = True
         self.all_processes.send(worker.Exit())
         while len(self.exited) < len(self.all_processes):
-            self._read_messages(None)
+            self.handle_message(self.ctx.recv())
 
     def ref(self) -> int:
         return next(self.next_ref)
 
     def ident(self) -> int:
-        r = next(self.next_ident)
-        self.tracebacks.append(traceback.extract_stack())
+        r = self.last_ident = next(self.next_ident)
+        self.tracebacks.append(traceback.extract_stack()[:-2])
         return r
 
     def _flush_deletes(self, device_mesh: 'DeviceMesh') -> Optional[worker.DeleteRefs]:
@@ -111,7 +130,7 @@ class _Controller:
 
     def _read_messages(self, timeout: Optional[float]):
         if self.controller_status_ttl() == 0:
-            self.all_processes.send(worker.ControllerStatus(self.ident()))
+            self.all_processes.send(worker.ControllerStatus(self.last_ident))
             self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
         for msg in self.ctx.recvready(timeout):
             self.handle_message(msg)
@@ -128,20 +147,24 @@ class _Controller:
     def ProcessExited(self, proc, result):
         self.exited[proc] = result
 
+    def ProcessStarted(self, proc, pid):
+        pass
+
     def Restarted(self, proc, result):
         self.exited[proc] = result
 
-    def ValueResult(self, proc, ident, value):
+    def FetchResult(self, proc, ident, value):
         self.incomplete_futures.pop(ident)._set_result(value)
 
-    def ValueException(self, proc, ident, failing_ident):
+    def FetchException(self, proc, ident, failing_ident):
         self.incomplete_futures[ident]._set_result(self.failures[failing_ident][proc.rank])
 
     def Status(self, proc, last_completed_ident, failed_idents):
         # record failure messages in status report for later reporting
-        for ident, (exception, worker_frames) in failed_idents.items():
+        for ident, remote_exception in failed_idents.items():
             frames = self.tracebacks[ident - (self.min_last_completed_ident + 1)]
-            self.failures[ident][proc.rank] = worker.RemoteException(exception, frames + worker_frames)
+            remote_exception.controller_frames = frames
+            self.failures[ident][proc.rank] = remote_exception
 
         # advance what our last completed action was, and
         # trim the list of tracebacks if we no longer need them.
@@ -171,20 +194,22 @@ class Referenceable:
 def remote_function(path: str):
     return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active_mesh, _active_stream, func)
 
-def _ident(*args):
-    return args
-
-def remote_value(path: str):
-    def wrapper(**mesh_coordinates: int):
-        return lambda *args, **kwargs: _dispatch_remote_value(path, mesh_coordinates, args, kwargs)
-
-def _dispatch_remote_value(path: str, mesh_coordinates: Dict[str, int], args: Tuple[Any, ...], kwargs: Dict[str, Any]):
-    if _active_mesh is None:
-        raise ValueError('No device mesh is active')
+def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: Optional[str] = None):
+    """
+    Retrieve the shard at `coordinates` of the current device mesh of each tensor in obj.
+        obj - a pytree containing the tensors the fetch
+        coordinates - a dictionary from mesh dimension name to coordinate of the shard
+                      If None, this will fetch from coordinate 0 for all dimensions (useful after all_reduce/all_gather)
+        preprocess - an optional specifier for a remote function that is applyied to obj before returning the value.
+                     This can be used to turn the tensor into some non-tensor values before copying it back
+    """
+    dtensor_check('fetch_shard', (obj,), {}, _active_mesh, _active_stream)
     fut, ident = _active_mesh.ctrl.future()
-    process = _active_mesh._process(mesh_coordinates)
-    process.send(worker.RemoteValue(ident, path, args, kwargs))
+    process = _active_mesh._process(coordinates)
+    process.send(worker.FetchValue(ident, preprocess, obj, _active_stream))
     return fut
+
+
 
 PyTree = Union[Dict[str, 'PyTree'], List['PyTree'], Tuple['PyTree',...], 'Tensor']
 
@@ -264,14 +289,16 @@ class DeviceMesh(Referenceable):
             raise KeyError(f'{self} does not have dimension {repr(dim)}')
         return torch.full((), 0, dtype=torch.long)
 
-    def _process(self, mesh_coordinates: Dict[str, int]):
+    def _process(self, coordinates: Optional[Dict[str, int]]):
+        if coordinates is None:
+            return self.processes[0]
         stride = 1
         offset = 0
-        extra = set(mesh_coordinates.keys()) - set(self.dims.keys())
+        extra = set(coordinates.keys()) - set(self.dims.keys())
         if extra:
             raise KeyError(f'{list(extra)}')
         for dim, size in reversed(self.dims.items()):
-            idx = mesh_coordinates.get(dim, 0)
+            idx = coordinates[dim]
             if idx < 0:
                 idx += size
             if idx < 0 or idx >= size:
@@ -280,6 +307,13 @@ class DeviceMesh(Referenceable):
             stride *= size
         return self.processes[offset]
 
+    def _use(self, tensor):
+        borrows = tensor._borrows
+        if tensor.stream is not borrows.origin_stream:
+            id, used = borrows.active.pop(tensor.stream)
+            if not used:
+                self._send(worker.BorrowFirstUse(id))
+            borrows.active[tensor.stream] = (id, True)
 
 
 @remote_function('controller.worker._reduce')
@@ -305,12 +339,14 @@ def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=No
 
 
 
-class Stream:
+class Stream(Referenceable):
     name: str
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, _default=False):
         self.name = name
+        self.default = _default
         self.ctrl = None
+        self.ref = None
 
     def __repr__(self):
         return f'<Stream({repr(self.name)}) at {hex(id(self))}>'
@@ -335,6 +371,19 @@ class Stream:
 
         raise NotImplementedError()
 
+    def delete_ref(self, ref):
+        # streams are not frequently created/destroyed so
+        # no need to buffer the delets
+        assert self.ctrl is not None
+        if not self.ctrl._shutdown:
+            self.ctrl.all_processes.send(worker.DeleteRefs([ref]))
+
+    def define_ref(self):
+        assert self.ctrl is not None
+        r = self.ctrl.ref()
+        self.ctrl.all_processes.send(worker.CreateStream(r, self.default))
+        return r
+
     @contextmanager
     def coalesce(self):
         """
@@ -356,7 +405,19 @@ class Stream:
         If not `mutable` both `self` and `t.stream` can read from t's storage but neither can write to it.
         """
         self._use_controller(t.mesh.ctrl)
-        raise NotImplementedError()
+        assert self.ctrl is not None
+        borrows = t._borrows
+        if mutable and borrows.active:
+            raise RuntimeError(f"Cannot borrow this tensor mutably because it (or a view) is already being borrowed non-mutably.")
+
+        already_borrowed = self in borrows.active
+        r = Tensor(t._fake, t.mesh, self, True)
+        assert r.ref is not None
+        t.mesh._send(worker.BorrowCreate(r.ref, t, t.stream, self, already_borrowed))
+        if not already_borrowed:
+            borrows.active[self] = (r.ref, False)
+            borrows.writing_stream = self if mutable else None
+        return r
 
 
 class TensorOptions(TypedDict, total=False):
@@ -381,10 +442,9 @@ class Tensor(Referenceable, BaseTensor):
     stream: Stream
     mesh: DeviceMesh
 
-
     def __new__(
         cls,
-        fake: torch.Tensor, mesh: DeviceMesh, stream: Stream
+        fake: torch.Tensor, mesh: DeviceMesh, stream: Stream, borrowed: bool
     ):
         r = torch.Tensor._make_wrapper_subclass(
             cls,
@@ -397,9 +457,12 @@ class Tensor(Referenceable, BaseTensor):
             requires_grad=fake.requires_grad,
         )
         r._fake = fake
-        r.ref = mesh.ctrl.ref()
+        ctrl = mesh.ctrl
+        r.ref = ctrl.ref()
         r.mesh = mesh
         r.stream = stream
+        r._borrowed = borrowed
+        r._borrows.aliases.add(r)
         return r
 
     @classmethod
@@ -411,11 +474,47 @@ class Tensor(Referenceable, BaseTensor):
 
         return dtensor_dispatch(function, args, kwargs, _active_mesh, _active_stream, func)
 
-    def __init__(self, fake: torch.Tensor, mesh: DeviceMesh, stream: Stream):
+    def __init__(self, fake: torch.Tensor, mesh: DeviceMesh, stream: Stream, borrowed: bool):
         pass
 
     def __repr__(self):
        return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={self._fake})"
+
+    def drop(self):
+        if self.ref is None:
+            return
+        borrows = self._borrows
+        for alias in borrows.aliases:
+            if alias.stream is not self.stream:
+                continue
+            alias._drop_ref()
+        if borrows.origin_stream is not self.stream:
+            id, _ = borrows.active.pop(self.stream)
+            self.mesh._send(worker.BorrowDrop(id))
+            if not borrows.active:
+                borrows.writing_stream = borrows.origin_stream
+
+        # we should be in the tensors list as well
+        assert self.ref is None
+
+    @property
+    def _borrows(self) -> _Borrows:
+        storage = self._fake.untyped_storage()
+        ctrl = self.mesh.ctrl
+        if storage not in ctrl.allocation_borrows:
+            ctrl.allocation_borrows[storage] = _Borrows(self.stream)
+        return ctrl.allocation_borrows[storage]
+
+    @property
+    def dropped(self):
+        return self.ref is None
+
+    def _drop_ref(self):
+        assert self.ref is not None
+        # silence borrowing warning
+        self._borrowed = False
+        self.delete_ref(self.ref)
+        self.ref = None
 
 
     def to_mesh(self, mesh: DeviceMesh):
@@ -494,6 +593,8 @@ class Tensor(Referenceable, BaseTensor):
         pass
 
     def delete_ref(self, ref: int):
+        if self._borrowed:
+            raise ValueError('t.drop() must be called before a borrowed tensor is freed to specify when the borrowed tensor should return to its origin stream.')
         mesh = self.mesh
         mesh.ctrl.pending_del[mesh].append(ref)
 
@@ -519,6 +620,9 @@ Use `with active_mesh(m):` to switch the active mesh, or move the tensor to the 
 WRONG_STREAM
 A tensor being passed is on a stream that is not the current active stream. Use with `active_stream(s)` to switch streams, or
 move the tensor to the correct stream with `.borrow`.
+
+DROPPED
+This tensor, or a view of it, was explicitly deleted with the t.drop() function and is no longer usable.
 """
 
 explain = dict(entry.split('\n', 1) for entry in _explain.split('\n\n'))
@@ -531,6 +635,8 @@ def dtensor_check(func, args, kwargs, device_mesh, stream) -> Tuple[List['Tensor
                 return 'WRONG_MESH'
             elif t.stream is not stream:
                 return 'WRONG_STREAM'
+            elif t.dropped:
+                return 'DROPPED'
             else:
                 return '.'
         elif isinstance(t, torch.Tensor):
@@ -540,7 +646,8 @@ def dtensor_check(func, args, kwargs, device_mesh, stream) -> Tuple[List['Tensor
 
     def tensor_check(x):
         if isinstance(x, torch.Tensor):
-            if isinstance(x, Tensor) and x.mesh is device_mesh and x.stream is stream:
+            if isinstance(x, Tensor) and x.mesh is device_mesh and x.stream is stream and not x.dropped:
+                device_mesh._use(x)
                 return True
             fargs, fkwargs = tree_map(stringify, (args, kwargs))
             actuals = ', '.join(str(a) for a in fargs)
@@ -563,9 +670,16 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
 
     if callable(result_type):
         fake_input_tensors = [d._fake for d in dtensors]
+        before_versions = [f._version for f in fake_input_tensors]
         fake_args, fake_kwargs = unflatten(fake_input_tensors)
-        with fake_mode, active_mesh(None):
-            result = result_type(*fake_args, **fake_kwargs)
+        result = ctrl._run_fake(result_type, fake_args, fake_kwargs)
+        for i in range(len(dtensors)):
+            if before_versions[i] < fake_input_tensors[i]._version:
+                writing_stream = dtensors[i]._borrows.writing_stream
+                if writing_stream is not stream:
+                    reason = "it is read only because it is being borrowed" if writing_stream is None \
+                             else f"it can only be mutated by f{writing_stream}"
+                    raise ValueError(f"Tensor input {i} would be mutated by this operator but {reason}")
         fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
     else:
         result = result_type
@@ -575,8 +689,8 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
 
     # sometimes operators return references to inputs, in which case the result should be the same DTensor object
     # otherwise we create a new DTensor with a new RemoteRef for the result
-    result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream) for fake in fake_result_dtensors)
-    device_mesh._send(worker.CallFunction(device_mesh.ctrl.ident(), tuple(r.ref for r in result_dtensors), func, args, kwargs))
+    result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream, False) for fake in fake_result_dtensors)
+    device_mesh._send(worker.CallFunction(device_mesh.ctrl.ident(), tuple(r.ref for r in result_dtensors), func, args, kwargs, stream))
     results = unflatten_result(result_dtensors)
     return results
 

@@ -1,16 +1,14 @@
-from supervisor import LocalMessageQueue, ProcessList, get_message_queue, TTL
-from supervisor.logging import initialize_logging
-from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple, Callable, Any
-from typing_extensions import Unpack
 from contextlib import contextmanager
-import math
+from supervisor import LocalMessageQueue, get_message_queue, TTL
+from supervisor.logging import initialize_logging
+from typing import Dict, NamedTuple, Any, Union, Optional, List, Tuple, Callable
 import os
 import importlib
 import logging
 from .tree import flatten, tree_map
 import torch
 import torch.distributed
-from traceback import extract_tb, FrameSummary
+from traceback import extract_tb, FrameSummary, format_list
 
 logger = logging.getLogger(__name__)
 
@@ -25,24 +23,41 @@ class Ref:
         return Ref, (self.id,)
 
 class RemoteException(Exception):
-    def __init__(self, exception: Exception, traceback: Optional[List[FrameSummary]] = None):
+    def __init__(self, exception: Exception, worker_frames: Optional[List[FrameSummary]] = None):
         self.exception = exception
-        if traceback is not None:
-            traceback = extract_tb(exception.__traceback__)
-        self.traceback = traceback
+        if worker_frames is None:
+            worker_frames = extract_tb(exception.__traceback__)
+        self.worker_frames = worker_frames
+        self.controller_frames: Optional[List[FrameSummary]] = None
 
+    def __str__(self):
+        try:
+            exe = str(self.exception)
+            worker_tb = ''.join(format_list(self.worker_frames))
+            controller_tb = ''.join(format_list(self.controller_frames)) if self.controller_frames is not None else '<unset>'
+            return f'A remote function has failed asynchronously.\n' \
+                f'Traceback of where the remote function was issued on controller (most recent call last):\n{controller_tb}' \
+                f'Traceback of where the remote function failed on worker (most recent call last):\n{worker_tb}{type(self.exception).__name__}: {exe}'
+        except Exception as e:
+            print(e)
+            return "oops"
 
 class CreateDeviceMesh(NamedTuple):
     result: int
     dims: Dict[str, int]
     ranks: List[int]
 
+class CreateStream(NamedTuple):
+    result: int
+    default: bool
+
 class CallFunction(NamedTuple):
     ident: int
-    results: Tuple[int,...]
+    results: Tuple[int, ...]
     function: Union[str, Callable]
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
+    stream: Any
 
 class Exit(NamedTuple):
     pass
@@ -65,20 +80,19 @@ class Dim(NamedTuple):
     size: int
     process_group: Any
 
-class GetValue(NamedTuple):
+class FetchValue(NamedTuple):
     ident: int
-    function: str
-    args: Tuple[Any, ...]
-    kwargs: Dict[str, Any]
+    function: Optional[str]
+    object: Any
+    stream: Any
 
-class ValueResult(NamedTuple):
+class FetchResult(NamedTuple):
     ident: int
     value: Any
 
-class ValueException(NamedTuple):
+class FetchException(NamedTuple):
     ident: int
     failing_ident: int
-
 
 class Status(NamedTuple):
     last_completed_ident: int
@@ -90,6 +104,19 @@ class Status(NamedTuple):
 # to workers
 class ControllerStatus(NamedTuple):
     ident: int
+
+class BorrowCreate(NamedTuple):
+    result: int
+    tensor: Any
+    from_stream: Any
+    to_stream: Any
+    alias: bool # is this an alias of an already existing borrow
+
+class BorrowDrop(NamedTuple):
+    borrow: int
+
+class BorrowFirstUse(NamedTuple):
+    borrow: int
 
 class DeviceMesh:
     def __init__(self, dims: Dict[str, int], ranks: List[int], index: int):
@@ -151,6 +178,57 @@ class DependentOnError(Exception):
     def __init__(self, ident: int):
         self.ident = ident
 
+class Stream:
+    cuda_stream: Optional[torch.cuda.Stream]
+
+    def __init__(self, default: bool):
+        if default:
+            self._cuda_stream = None
+        else:
+            self._cuda_stream = torch.cuda.Stream()
+
+    @property
+    def cuda_stream(self):
+        if self._cuda_stream is None:
+            return torch.cuda.current_stream()
+        else:
+            return self._cuda_stream
+
+    @contextmanager
+    def enable(self):
+        if self._cuda_stream is None:
+            yield
+            return
+        with torch.cuda.stream(self._cuda_stream):
+            yield
+
+    def event(self):
+        e = torch.cuda.Event()
+        self.cuda_stream.record_event(e)
+        return e
+
+    def wait_event(self, event):
+        self.cuda_stream.wait_event(event)
+
+    def wait_stream(self, stream):
+        self.cuda_stream.wait_stream(stream.cuda_stream)
+
+class Borrow:
+    def __init__(self, from_stream: Stream, to_stream: Stream):
+        self.from_stream = from_stream
+        self.to_stream = to_stream
+        self.event = from_stream.event()
+
+    def use(self):
+        self.to_stream.wait_event(self.event)
+        self.event = None
+
+    def drop(self):
+        if self.event is not None:
+            return
+        self.from_stream.wait_stream(self.to_stream)
+
+
 class Worker:
     def __init__(self, q: LocalMessageQueue, store, rank: int, world: int, local_rank: int):
         # remote ref id to local value
@@ -163,6 +241,7 @@ class Worker:
         self.last_completed_ident = -1
         self.last_send_status = -1
         self.failed_idents: Dict[int, RemoteException] = {}
+        self.borrows: Dict[int, Borrow] = {}
 
     def handle_message(self, event: NamedTuple):
         cmd = event.__class__.__name__
@@ -199,16 +278,18 @@ class Worker:
     def _dependent_error(self, ident: int, exception: Exception) -> DependentOnError:
         if isinstance(exception, DependentOnError):
             return exception
-        exception = DependentOnError(ident)
         self.failed_idents[ident] = RemoteException(exception)
+        exception = DependentOnError(ident)
         return exception
 
-    def CallFunction(self, ident: int, results: Tuple[int], function: Union[str, Callable], args: Tuple[Any, ...], kwargs: Dict[str, Any]):
+    def CallFunction(self, ident: int, results: Tuple[int], function: Union[str, Callable], args: Tuple[Any, ...], kwargs: Dict[str, Any], streamref: Ref):
         try:
+            stream: Stream = self.lookup(streamref)
             args, kwargs = tree_map(self.lookup, (args, kwargs))
             if isinstance(function, str):
                 function = self._resolve_function(function)
-            result = function(*args, **kwargs)
+            with stream.enable():
+                result = function(*args, **kwargs)
             tensors, _ = flatten(result, lambda x: isinstance(x, torch.Tensor))
             assert len(results) == len(tensors)
             for r, t in zip(results, tensors):
@@ -220,13 +301,19 @@ class Worker:
         finally:
             self.last_completed_ident = ident
 
-    def GetValue(self, ident: int, function_str: str, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
+    def CreateStream(self, result: int, default: bool):
+        self.define(result, Stream(default))
+
+    def FetchValue(self, ident: int, function_str: Optional[str], obj: Any, streamref: Ref):
         self.last_completed_ident = ident
         try:
-            function = self._resolve_function(function_str)
-            args, kwargs = tree_map(self.lookup, (args, kwargs))
-            value = function(*args, **kwargs)
-            self.q.send(ValueResult(ident, value))
+            stream: Stream = self.lookup(streamref)
+            obj = tree_map(self.lookup, obj)
+            with stream.enable():
+                if function_str is not None:
+                    function = self._resolve_function(function_str)
+                    obj = function(obj)
+                self.q.send(FetchResult(ident, obj))
         except Exception as e:
             err = self._dependent_error(ident, e)
             # make sure controller knows the error message
@@ -234,7 +321,7 @@ class Worker:
             if err.ident in self.failed_idents:
                 self._send_status()
                 assert err.ident not in self.failed_idents
-            self.q.send(ValueException(ident, err.ident))
+            self.q.send(FetchException(ident, err.ident))
 
     def ControllerStatus(self, ident: int):
         self.last_completed_ident = ident
@@ -250,14 +337,33 @@ class Worker:
         for id in refs:
             del self.env[id]
 
+    def BorrowCreate(self, result: int, tensorref: Ref, from_streamref, to_streamref, already_borrowed: bool):
+        try:
+            from_stream = self.lookup(from_streamref)
+            to_stream = self.lookup(to_streamref)
+            tensor = self.lookup(tensorref)
+        except DependentOnError as e:
+            self.define(result, e)
+            return
+        self.define(result, tensor)
+        if not already_borrowed:
+            self.borrows[result] = Borrow(from_stream, to_stream)
+
+    def BorrowFirstUse(self, borrow: int):
+        self.borrows[borrow].use()
+
+    def BorrowDrop(self, borrow: int):
+        self.borrows.pop(borrow).drop()
+
     def define(self, r: int, value: Any):
         self.env[r] = value
 
     def _send_status(self):
-        if self.last_completed_ident < self.last_send_status:
+        if self.last_completed_ident > self.last_send_status:
             self.q.send(Status(self.last_completed_ident, self.failed_idents))
             self.failed_idents.clear()
             self.last_send_status = self.last_completed_ident
+            logger.info("updating last send status %s", self.last_send_status)
 
     def event_loop(self):
         STATUS_INTERVAL = 1.0
@@ -270,6 +376,8 @@ class Worker:
             except TimeoutError:
                 pass
             except StopIteration:
+                self.q.recvready(0)
+                self.q.recvready(.01)
                 return
             if status_ttl() == 0:
                 status_ttl = TTL(STATUS_INTERVAL)
@@ -286,9 +394,17 @@ def worker_main(_restartable):
     torch.distributed.init_process_group(backend='nccl', world_size=world, rank=rank, store=store)
     q = get_message_queue()
     # CUDA_VISIBLE_DEVICES should be set on launch to LOCAL_RANK
-    worker = Worker(q, store, rank, world, local_rank)
-    worker.event_loop()
-    while _restartable:
+    while True:
+        worker = Worker(q, store, rank, world, local_rank)
+        worker.event_loop()
+        if not _restartable:
+            break
         q.send(Restarted(0))
         logger.info("restarting")
-        worker.event_loop()
+
+
+# the_borrowed_tensor = stream.borrow(x)
+# the_borrow.drop_borrow() # now any views of this can no longer be used on the stream
+                           # have to track via weak references to storages we care about
+# controller has a weakkeydictionary of storages for fake tensors to weakrefs to dtensors
+# controller also keeps the restriction of who can read/write the storage

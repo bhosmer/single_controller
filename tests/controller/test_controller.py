@@ -1,7 +1,7 @@
 from collections import defaultdict
 from supervisor import Context, HostConnected
 from supervisor.host import Host as HostManager
-from controller import world_mesh, active_mesh, _Controller, DeviceMesh, remote_function, Future, RemoteException
+from controller import world_mesh, active_mesh, _Controller, DeviceMesh, remote_function, Future, RemoteException, fetch_shard, fake_mode, Stream, active_stream
 from contextlib import contextmanager, ExitStack
 from threading import Thread
 from functools import cache, partial
@@ -9,7 +9,9 @@ from unittest import main, TestCase
 from time import sleep
 import torch
 import signal
+import os
 from unittest.mock import patch
+from weakref import WeakKeyDictionary
 
 @remote_function('controller.worker.log')
 def log(*args):
@@ -18,6 +20,13 @@ def log(*args):
 @remote_function('builtins.list')
 def rlist(elem):
     return elem
+
+@remote_function('controller._test_remote_functions.do_bogus_tensor_work')
+def do_bogus_tensor_work(x, y):
+    return x + y  # real function actually does x @ y
+
+
+_all_hosts = WeakKeyDictionary()
 
 @contextmanager
 def _get_context(N, gpu_per_host):
@@ -37,6 +46,7 @@ def _get_context(N, gpu_per_host):
 
     for _ in range(N):
         host = HostManager("tcp://127.0.0.1:55555")
+        _all_hosts[host] = True
         thread = Thread(target=partial(run_host, host))
         thread.start()
         threads.append(thread)
@@ -180,6 +190,29 @@ class TestController(TestCase):
             rs = x.reduce('gpu', 'sum', scatter=True)
             log("x: %s\ny:%s\ng:%s\natoa:%s\nrs:%s\n", x, y, g, atoa, rs)
 
+    def test_fetch(self):
+        with self.local_device_mesh(2, 2) as device_mesh:
+            h = device_mesh.rank('host')
+            g = device_mesh.rank('gpu')
+            for hi in range(2):
+                for gi in range(2):
+                    x, y = fetch_shard((h, g), dict(host=hi, gpu=gi)).result()
+                    with active_mesh(None):
+                        self.assertTrue((hi, gi) == (x.item(), y.item()))
+
+    def test_remote_exception(self):
+        with self.local_device_mesh(2, 2) as device_mesh:
+            x = torch.rand(3, 4)
+            y = torch.rand(3, 4)
+            z = do_bogus_tensor_work(x, y)
+            a = z + x
+            b = x + y
+            # this dependent on z are gonna fail
+            with self.assertRaisesRegex(RemoteException, 'do_bogus_tensor_work'):
+                r = fetch_shard(a).result(timeout=5)
+            # but values not dependent on z are fine
+            fetch_shard(b).result(timeout=5)
+
     def test_future(self):
         the_time = 0
         the_messages = []
@@ -225,6 +258,27 @@ class TestController(TestCase):
             the_messages = [(0, lambda: None), (.2, lambda: f._set_result(7))]
             the_time = 0
             self.assertEqual(7, f.result(timeout=.3))
+
+    def test_mutate(self):
+
+        with self.local_device_mesh(2, 2) as device_mesh:
+            x = torch.rand(3, 4).cuda()
+            x.abs_()
+            s = Stream('other')
+            b = s.borrow(x)
+            with self.assertRaisesRegex(ValueError, "would be mutated"):
+                x.abs_()
+            with active_stream(s):
+                c = b.add(b)
+            b.drop()
+            x.abs_()
+            b = s.borrow(x, mutable=True)
+            with active_stream(s):
+                b.abs_()
+            b.drop()
+            x.abs_()
+
+
 
     def test_simple_examples(self):
         # `local_device_mesh` is just a helper for testing
@@ -292,4 +346,14 @@ class TestController(TestCase):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # this is normally done by the host process in a singal handler
+        # but we are using threads to run the host managers in this
+        # test setup, it is necessary to have this process issue the
+        # kills of any running worker processes
+        for host in _all_hosts.keys():
+            for proc in host.process_table.values():
+                os.killpg(proc.subprocess.pid, signal.SIGKILL)
+        raise
