@@ -131,13 +131,16 @@ class TensorFactory(NamedTuple):
     dtype: torch.dtype
     layout: torch.layout
     device: torch.device
-    memory_format: torch.memory_format
+
+    @staticmethod
+    def from_tensor(t):
+        return TensorFactory(t.size(), t.dtype, t.layout, t.device)
 
     def empty(self):
-        return torch.empty(self.size, dtype=self.dtype, layout=self.layout, device=self.device, memory_format=self.memory_format)
+        return torch.empty(self.size, dtype=self.dtype, layout=self.layout, device=self.device)
 
     def zeros(self):
-        return torch.full(self.size, 0, dtype=self.dtype, layout=self.layout, device=self.device, memory_format=self.memory_format)
+        return torch.full(self.size, 0, dtype=self.dtype, layout=self.layout, device=self.device)
 
 class DeviceMesh:
     def __init__(self, dims: Dict[str, int], ranks: List[int], index: int):
@@ -382,11 +385,12 @@ class Worker:
         except DependentOnError as e:
             self.define(result, e)
             return
-        with stream:
+        with stream.enable():
             ops = []
             P2POp = torch.distributed.P2POp
             isend, irecv = torch.distributed.isend, torch.distributed.irecv
             try:
+                index = from_ranks.index(self.rank)
                 try:
                     tensor = self.lookup(tensorref)
                 except DependentOnError:
@@ -394,16 +398,17 @@ class Worker:
                     # the host will see on status, but it will not immediately know
                     # what dependended on this downstream that also has to be invalid now.
                     tensor = factory.zeros()
-
-                index = from_ranks.index(self.rank)
                 to_rank = to_ranks[index]
                 ops.append(P2POp(isend, tensor, to_rank))
             except ValueError:
-                pass
+                to_rank = None
 
             try:
                 index = to_ranks.index(self.rank)
                 from_rank = from_ranks[index]
+                if from_rank == to_rank:
+                    assert tensor is not None
+                    self.define(result,  tensor)
                 recv = factory.empty()
                 ops.append(P2POp(irecv, recv, from_rank))
                 self.define(result, recv)
@@ -450,6 +455,8 @@ def worker_main(_restartable):
     logger.info("starting, restartable=%s", _restartable)
     store = torch.distributed.TCPStore(os.environ['STORE_HOSTNAME'], int(os.environ['STORE_PORT']))
     torch.distributed.init_process_group(backend='nccl', world_size=world, rank=rank, store=store)
+    b = torch.zeros(1, device='cuda')
+    torch.distributed.all_reduce(b)
     q = get_message_queue()
     # CUDA_VISIBLE_DEVICES should be set on launch to LOCAL_RANK
     while True:
@@ -461,8 +468,7 @@ def worker_main(_restartable):
         logger.info("restarting")
 
 
-# the_borrowed_tensor = stream.borrow(x)
-# the_borrow.drop_borrow() # now any views of this can no longer be used on the stream
-                           # have to track via weak references to storages we care about
-# controller has a weakkeydictionary of storages for fake tensors to weakrefs to dtensors
-# controller also keeps the restriction of who can read/write the storage
+# 1. Test the mesh movement implementation for correctness
+# 2. figure out how to move the 'success' criteria for fetch_shard to the controller
+#    so it can be aware of any errors that happened on other workers. We may need to
+#    broadcast a status/response call.

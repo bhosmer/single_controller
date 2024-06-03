@@ -279,6 +279,27 @@ class TestController(TestCase):
             del b
             x.abs_()
 
+    def test_movement(self):
+        with self.local_device_mesh(2, 2) as device_mesh:
+            
+            sm0 = device_mesh(host=0)
+            sm1 = device_mesh(host=1)
+
+            with active_mesh(sm0):
+                x = torch.rand(3, 4, device='cuda')
+                log("x: %s", x)
+                y = x.to_mesh(sm1)
+
+            a = torch.rand(3, 4, device='cuda')
+
+            b = a.slice_mesh(host=0)
+            d = b.to_mesh(sm0)
+            c = b.to_mesh(sm1)
+            with active_mesh(sm0):
+                log("d: %s", d)
+            with active_mesh(sm1):
+                log("y: %s", y)
+                log("c: %s", c)
 
 
     def test_simple_examples(self):

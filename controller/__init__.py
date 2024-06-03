@@ -105,9 +105,12 @@ class _Controller:
                                         FunctionCall('controller.worker.worker_main',
                                                      _restartable=_restartable),
                                         processes_per_host=gpu_per_host,
-                                        env={'CUDA_VISIBLE_DEVICES': '$LOCAL_RANK',
+                                        env={'CUDA_VISIBLE_DEVICES':  '$LOCAL_RANK',
+                                             # supervisor_pipe is a unique ID per Host object,
+                                             # so it lets us put multiple processes on the same GPU.
+                                             'NCCL_HOSTID': '$SUPERVISOR_PIPE',
                                              'STORE_HOSTNAME': store.host,
-                                             'STORE_PORT': str(store.port),})
+                                             'STORE_PORT': str(store.port), })
 
     def shutdown(self):
         self._shutdown = True
@@ -604,6 +607,9 @@ class Tensor(Referenceable, BaseTensor):
             return
         mesh = self.mesh
         mesh.ctrl.pending_del[mesh].append(ref)
+    
+    def _factory(self):
+        return worker.TensorFactory.from_tensor(self._fake)
 
 
 class MeshSliceTensor:
@@ -629,13 +635,13 @@ class MeshSliceTensor:
 
         combined_processes = self.slicing.processes
         if self.slicing.processes is not mesh.processes:
-            combined_processes = ProcessList(sorted(set(self.slicing.processes).union(mesh.processes)))
+            combined_processes = ProcessList(sorted(set(self.slicing.processes).union(mesh.processes), key=lambda p: p.rank))
 
         from_ranks = [p.rank for p in self.slicing.processes]
         to_ranks = [p.rank for p in mesh.processes]
         r = Tensor(self.tensor._fake, mesh, _active_stream, False)
-        combined_processes.send(worker.SendTensor(r, from_ranks, to_ranks, self.tensor, self.tensor.stream))
-
+        combined_processes.send(worker.SendTensor(r.ref, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
+        return r
 
 
 _explain = """\
