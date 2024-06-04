@@ -13,7 +13,8 @@ from contextlib import contextmanager
 import math
 from . import messages
 from .reference import Referenceable
-from collections import defaultdict, deque
+from .history import _History, RemoteException, _Invocation
+from collections import defaultdict
 import itertools
 import socket
 import logging
@@ -55,91 +56,6 @@ class _Borrows:
         self.aliases = WeakSet()
         # what active borrows of this exist?
         self.active: Dict['Stream', _Borrow] = {}
-
-class RemoteException(Exception):
-    def __init__(self, ident: int, exception: Exception, controller_frames: List[traceback.FrameSummary], worker_frames: List[traceback.FrameSummary]):
-        self.ident = ident
-        self.exception = exception
-        self.controller_frames = controller_frames
-        self.worker_frames = worker_frames
-
-    def __str__(self):
-        try:
-            exe = str(self.exception)
-            worker_tb = ''.join(traceback.format_list(self.worker_frames))
-            controller_tb = ''.join(traceback.format_list(self.controller_frames)) if self.controller_frames is not None else '<unset>'
-            return f'A remote function has failed asynchronously.\n' \
-                f'Traceback of where the remote function was issued on controller (most recent call last):\n{controller_tb}' \
-                f'Traceback of where the remote function failed on worker (most recent call last):\n{worker_tb}{type(self.exception).__name__}: {exe}'
-        except Exception as e:
-            print(e)
-            return "oops"
-
-class _Invocation:
-    def __init__(self, traceback: List[traceback.FrameSummary]):
-        self.traceback = traceback
-        self.users = set['_Invocation']()
-        self.failure: Optional[RemoteException] = None
-        self.fut: Optional[Future] = None
-        self.fut_value: Any = None
- 
-    def fail(self, remote_exception: RemoteException):
-        if self.failure is None or self.failure.ident > remote_exception.ident:
-            self.failure = remote_exception
-            return True
-        return False
-        
-
-class _History:
-    def __init__(self, N):
-        self.next_ident = itertools.count()
-        self.first_uncompleted_ident = [0 for _ in range(N)]
-        self.min_first_uncompleted_ident = 0
-        self.invocations = deque[_Invocation]()
-        self.last_assigned_ident = -1
-    
-    def invocation(self, defs: Sequence['Tensor'], uses: Sequence['Tensor']):
-        r = _Invocation(traceback.extract_stack()[:-2])
-        for t in uses:
-            u = t._invocation
-            u.users.add(r)
-            if u.failure is not None:
-                r.fail(u.failure)
-        for t in defs:
-            t._invocation = r
-        return r
-
-    def ident(self, defs: Sequence['Tensor'], uses: Sequence['Tensor'], future: Optional['Future'] = None) -> int:
-        r = self.last_assigned_ident = next(self.next_ident)
-        invocation = self.invocation(defs, uses)
-        invocation.fut = future
-        self.invocations.append(invocation)
-        return r
-
-    def propagate_failure(self, ident, exception, worker_frames):
-        invocation = self.invocations[ident - self.min_first_uncompleted_ident]
-        remote_exception = RemoteException(ident, exception, invocation.traceback, worker_frames)
-        worklist = deque((invocation,))
-        while worklist:
-            invocation = worklist.popleft()
-            if invocation.fail(remote_exception):
-                worklist.extend(invocation.users)
-    
-    def rank_completed(self, rank, first_uncompleted_ident):
-        # advance what our last completed action was, and
-        # trim the list of tracebacks if we no longer need them.
-        prev = self.first_uncompleted_ident[rank]
-        self.first_uncompleted_ident[rank] = first_uncompleted_ident
-        if prev == self.min_first_uncompleted_ident:
-            self.min_first_uncompleted_ident = min(self.first_uncompleted_ident)            
-            for _ in range(self.min_first_uncompleted_ident - prev):
-                invocation = self.invocations.popleft()
-                if invocation.fut is not None:
-                    invocation.fut._set_result(invocation.fut_value if invocation.failure is None else invocation.failure)
-
-    def future_completed(self, ident, value):
-        invocation = self.invocations[ident - self.min_first_uncompleted_ident]
-        invocation.fut_value = value
 
 class _Controller:
     def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None, _store=None):
@@ -484,6 +400,10 @@ _valid_reduce = ['stack', 'sum', 'avg', 'product', 'min', 'max', 'band', 'bor', 
 class Tensor(Referenceable, BaseTensor):
     stream: Stream
     mesh: DeviceMesh
+    ref: Optional[int]
+    _borrowed: bool
+    _invocation: Optional[_Invocation]
+    _fake: torch.Tensor
 
     def __new__(
         cls,
@@ -506,6 +426,7 @@ class Tensor(Referenceable, BaseTensor):
         r.stream = stream
         r._borrowed = borrowed
         r._borrows.aliases.add(r)
+        r._invocation = None
         return r
 
     @classmethod
