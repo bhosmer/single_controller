@@ -11,18 +11,9 @@ import torch.distributed
 from traceback import extract_tb
 from . import messages
 from .tensor_factory import TensorFactory
+from .reference import Ref
 
 logger = logging.getLogger(__name__)
-
-class Ref:
-    def __init__(self, id: int):
-        self.id = id
-
-    def __repr__(self):
-        return f'r{self.id}'
-
-    def __reduce__(self):
-        return Ref, (self.id,)
 
 def log(*args):
     logger.info(*args)

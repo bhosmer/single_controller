@@ -12,7 +12,7 @@ from contextlib import contextmanager
 # from .base_tensor import BaseTensor
 import math
 from . import messages
-from .worker import Ref
+from .reference import Referenceable
 from collections import defaultdict, deque
 import itertools
 import socket
@@ -245,22 +245,6 @@ class _Controller:
     def Status(self, proc, first_uncompleted_ident):
         self.history.rank_completed(proc.rank, first_uncompleted_ident)
  
-class Referenceable:
-    def delete_ref(self, ref):
-        raise NotImplementedError("no delete_ref method")
-
-    def define_ref(self):
-        raise NotImplementedError("undefined ref with no define_ref method")
-
-    def __reduce_ex__(self, protocol):
-        if self.ref is None:
-            self.ref = self.define_ref()
-        return Ref, (self.ref,)
-
-    def __del__(self):
-        if self.ref is not None:
-            self.delete_ref(self.ref)
-
 def remote_function(path: str):
     return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active_mesh, _active_stream, func)
 
