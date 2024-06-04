@@ -14,6 +14,7 @@ import math
 from . import messages
 from .reference import Referenceable
 from .history import _History, RemoteException, _Invocation
+from .borrows import _Borrows, _Borrow
 from collections import defaultdict
 import itertools
 import socket
@@ -41,21 +42,6 @@ else:
     fake_mode = FakeTensorMode()
 
 _CONTROLLER_STATUS_INTERVAL = 2
-
-class _Borrow(NamedTuple):
-    id: int
-    used: bool
-    frames: List[traceback.FrameSummary]
-
-class _Borrows:
-    def __init__(self, origin_stream: 'Stream'):
-        self.origin_stream = origin_stream
-        # who can write to this storage?
-        self.writing_stream: Optional[Stream] = origin_stream
-        # what Tensor aliases exist for this storage
-        self.aliases = WeakSet()
-        # what active borrows of this exist?
-        self.active: Dict['Stream', _Borrow] = {}
 
 class _Controller:
     def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None, _store=None):
