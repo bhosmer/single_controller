@@ -11,7 +11,7 @@ import torch
 from contextlib import contextmanager
 # from .base_tensor import BaseTensor
 import math
-from . import worker
+from . import messages
 from .worker import Ref
 from collections import defaultdict, deque
 import itertools
@@ -190,26 +190,26 @@ class _Controller:
 
     def shutdown(self):
         self._shutdown = True
-        self.all_processes.send(worker.Exit())
+        self.all_processes.send(messages.Exit())
         while len(self.exited) < len(self.all_processes):
             self.handle_message(self.ctx.recv())
 
     def ref(self) -> int:
         return next(self.next_ref)
 
-    def _flush_deletes(self, device_mesh: 'DeviceMesh') -> Optional[worker.DeleteRefs]:
+    def _flush_deletes(self, device_mesh: 'DeviceMesh') -> Optional[messages.DeleteRefs]:
         to_delete = None
         if device_mesh in self.pending_del:
-            to_delete = worker.DeleteRefs(self.pending_del.pop(device_mesh))
+            to_delete = messages.DeleteRefs(self.pending_del.pop(device_mesh))
         # we also have to make sure if we have deletes to other device meshes,
         # they get processed before we do an op that will try to allocate memory
         for k, v in self.pending_del.items():
-            k._send(worker.DeleteRefs(v))
+            k._send(messages.DeleteRefs(v))
         self.pending_del.clear()
         return to_delete
 
     def _request_status(self):
-            self.all_processes.send(worker.RequestStatus(self.history.last_assigned_ident))
+            self.all_processes.send(messages.RequestStatus(self.history.last_assigned_ident))
 
     def _read_messages(self, timeout: Optional[float]):
         # XXX - how can we avoid always requesting status when waiting on futures?
@@ -277,7 +277,7 @@ def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: O
     fut = Future(_active_mesh.ctrl)
     ident = _active_mesh.ctrl.history.ident((), tensors, fut)
     process = _active_mesh._process(coordinates)
-    process.send(worker.FetchValue(ident, preprocess, obj, _active_stream))
+    process.send(messages.FetchValue(ident, preprocess, obj, _active_stream))
     return fut
 
 
@@ -298,19 +298,19 @@ class DeviceMesh(Referenceable):
     def define_ref(self):
         # Optimize: we do not have to send device meshes to all workers if we can
         # Create process groups as subsets
-        msg = worker.CreateDeviceMesh(self.ctrl.ref(), self.dims, [p.rank for p in self.processes])
+        msg = messages.CreateDeviceMesh(self.ctrl.ref(), self.dims, [p.rank for p in self.processes])
         self.processes.send(msg)
 
         return msg.result
 
     def delete_ref(self, ref: int):
         if not self.ctrl._shutdown:
-            self._send(worker.DeleteRefs([ref]))
+            self._send(messages.DeleteRefs([ref]))
 
     def _send(self, cmd: NamedTuple):
         to_delete = self.ctrl._flush_deletes(self)
         if to_delete:
-            self.processes.send(worker.CommandGroup([to_delete, cmd]))
+            self.processes.send(messages.CommandGroup([to_delete, cmd]))
         else:
             self.processes.send(cmd)
 
@@ -383,7 +383,7 @@ class DeviceMesh(Referenceable):
         if tensor.stream is not borrows.origin_stream:
             borrow = borrows.active[tensor.stream]
             if not borrow.used:
-                self._send(worker.BorrowFirstUse(borrow.id))
+                self._send(messages.BorrowFirstUse(borrow.id))
                 borrows.active[tensor.stream] = borrow._replace(used=True)
 
 
@@ -433,12 +433,12 @@ class Stream(Referenceable):
         # no need to buffer the delets
         assert self.ctrl is not None
         if not self.ctrl._shutdown:
-            self.ctrl.all_processes.send(worker.DeleteRefs([ref]))
+            self.ctrl.all_processes.send(messages.DeleteRefs([ref]))
 
     def define_ref(self):
         assert self.ctrl is not None
         r = self.ctrl.ref()
-        self.ctrl.all_processes.send(worker.CreateStream(r, self.default))
+        self.ctrl.all_processes.send(messages.CreateStream(r, self.default))
         return r
 
     @contextmanager
@@ -472,7 +472,7 @@ class Stream(Referenceable):
         r = Tensor(t._fake, t.mesh, self, True)
         self.ctrl.history.invocation((r,), (t,))
         assert r.ref is not None
-        t.mesh._send(worker.BorrowCreate(r.ref, t, t.stream, self, already_borrowed))
+        t.mesh._send(messages.BorrowCreate(r.ref, t, t.stream, self, already_borrowed))
         if not already_borrowed:
             borrows.active[self] = _Borrow(r.ref, False, traceback.extract_stack())
             borrows.writing_stream = self if mutable else None
@@ -549,7 +549,7 @@ class Tensor(Referenceable, BaseTensor):
             alias._drop_ref()
         if borrows.origin_stream is not self.stream:
             borrow = borrows.active.pop(self.stream)
-            self.mesh._send(worker.BorrowDrop(borrow.id))
+            self.mesh._send(messages.BorrowDrop(borrow.id))
             if not borrows.active:
                 borrows.writing_stream = borrows.origin_stream
 
@@ -652,7 +652,7 @@ class Tensor(Referenceable, BaseTensor):
         else:
             fake_output = self.mesh.ctrl._run_fake(_fake_reduce, (self._fake, self.mesh, dim, reduction, scatter), {})
         r = Tensor(fake_output, self.mesh, self.stream, borrowed=False)
-        self.mesh._send(worker.Reduce(r.ref, self, self._factory(), self.mesh, self.stream, dim, reduction, scatter, _inplace))
+        self.mesh._send(messages.Reduce(r.ref, self, self._factory(), self.mesh, self.stream, dim, reduction, scatter, _inplace))
         self.mesh.ctrl.history.invocation((r,), (self,))
         return r
 
@@ -677,7 +677,7 @@ class Tensor(Referenceable, BaseTensor):
         mesh.ctrl.pending_del[mesh].append(ref)
     
     def _factory(self):
-        return worker.TensorFactory.from_tensor(self._fake)
+        return messages.TensorFactory.from_tensor(self._fake)
 
 
 class MeshSliceTensor:
@@ -708,7 +708,7 @@ class MeshSliceTensor:
         from_ranks = [p.rank for p in self.slicing.processes]
         to_ranks = [p.rank for p in mesh.processes]
         r = Tensor(self.tensor._fake, mesh, _active_stream, False)
-        combined_processes.send(worker.SendTensor(r.ref, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
+        combined_processes.send(messages.SendTensor(r.ref, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
         self.tensor.mesh.ctrl.history.invocation((r,), (self.tensor,))
         return r
 
@@ -800,7 +800,7 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
     # otherwise we create a new DTensor with a new RemoteRef for the result
     result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream, False) for fake in fake_result_dtensors)
     ident = device_mesh.ctrl.history.ident(result_dtensors + tuple(mutates), dtensors)
-    device_mesh._send(worker.CallFunction(ident, tuple(r.ref for r in result_dtensors), tuple(r.ref for r in mutates), func, args, kwargs, stream))    
+    device_mesh._send(messages.CallFunction(ident, tuple(r.ref for r in result_dtensors), tuple(r.ref for r in mutates), func, args, kwargs, stream))    
     results = unflatten_result(result_dtensors)
     # XXX - realistically this would be done on a non-python thread, keeping our messages up to date
     # but we can approximate it by checking for all ready meassages whenever we schedule new work

@@ -8,7 +8,9 @@ import logging
 from .tree import flatten, tree_map
 import torch
 import torch.distributed
-from traceback import extract_tb, FrameSummary
+from traceback import extract_tb
+from . import messages
+from .tensor_factory import TensorFactory
 
 logger = logging.getLogger(__name__)
 
@@ -22,116 +24,13 @@ class Ref:
     def __reduce__(self):
         return Ref, (self.id,)
 
-class CreateDeviceMesh(NamedTuple):
-    result: int
-    dims: Dict[str, int]
-    ranks: List[int]
-
-class CreateStream(NamedTuple):
-    result: int
-    default: bool
-
-class CallFunction(NamedTuple):
-    ident: int
-    results: Tuple[int, ...]
-    mutates: Tuple[int, ...]
-    function: Union[str, Callable]
-    args: Tuple[Any, ...]
-    kwargs: Dict[str, Any]
-    stream: Any
-
-class Exit(NamedTuple):
-    pass
-
-class CommandGroup(NamedTuple):
-    commands: List[NamedTuple]
-
-class DeleteRefs(NamedTuple):
-    refs: List[int]
-
-class Restarted(NamedTuple):
-    result: int
-
 def log(*args):
     logger.info(*args)
-
 
 class Dim(NamedTuple):
     rank: int
     size: int
     process_group: Any
-
-class FetchValue(NamedTuple):
-    ident: int
-    function: Optional[str]
-    object: Any
-    stream: Any
-
-class FetchResult(NamedTuple):
-    ident: int
-    value: Any
-
-class RemoteFunctionFailed(NamedTuple):
-    failing_ident: int
-    exception: Exception
-    worker_frames: List[FrameSummary]
-
-class Status(NamedTuple):
-    first_uncompleted_ident: int
-
-# When the controller is waiting on a status update,
-# it will request one even if it is before the
-# periodic one.
-class RequestStatus(NamedTuple):
-    ident: int
-
-class BorrowCreate(NamedTuple):
-    result: int
-    tensor: Any
-    from_stream: Any
-    to_stream: Any
-    alias: bool # is this an alias of an already existing borrow
-
-class BorrowDrop(NamedTuple):
-    borrow: int
-
-class BorrowFirstUse(NamedTuple):
-    borrow: int
-
-class SendTensor(NamedTuple):
-    result: int
-    from_ranks: List[int]
-    to_ranks: List[int]
-    tensor: Any
-    factory: 'TensorFactory'
-    stream: Any
-
-class Reduce(NamedTuple):
-    result: int
-    local_tensor_ref: Any
-    factory: 'TensorFactory'
-    source_mesh_ref: Any
-    stream_ref: Any
-    dim: str
-    reduction: str
-    scatter: bool
-    inplace: bool
-
-class TensorFactory(NamedTuple):
-    size: Tuple[int,...]
-    dtype: torch.dtype
-    layout: torch.layout
-    device: torch.device
-
-    @staticmethod
-    def from_tensor(t):
-        return TensorFactory(t.size(), t.dtype, t.layout, t.device)
-
-    def empty(self):
-        return torch.empty(self.size, dtype=self.dtype, layout=self.layout, device=self.device)
-
-    def zeros(self):
-        return torch.full(self.size, 0, dtype=self.dtype, layout=self.layout, device=self.device)
 
 class DeviceMesh:
     def __init__(self, dims: Dict[str, int], ranks: List[int], index: int):
@@ -283,7 +182,7 @@ class Worker:
             exc = DependentOnError(ident)
             for r in results:
                 self.define(r, exc)
-            self.q.send(RemoteFunctionFailed(ident, e, extract_tb(e.__traceback__)))
+            self.q.send(messages.RemoteFunctionFailed(ident, e, extract_tb(e.__traceback__)))
         self.first_uncompleted_ident = ident + 1          
 
     def FetchValue(self, ident: int, function_str: Optional[str], obj: Any, streamref: Ref):
@@ -294,7 +193,7 @@ class Worker:
                 if function_str is not None:
                     function = self._resolve_function(function_str)
                     obj = function(obj)
-                self.q.send(FetchResult(ident, obj))
+                self.q.send(messages.FetchResult(ident, obj))
 
     def RequestStatus(self, ident: int):
         self.first_uncompleted_ident = ident + 1
@@ -430,7 +329,7 @@ class Worker:
 
     def _send_status(self):
         if self.first_uncompleted_ident > self.last_send_status:
-            self.q.send(Status(self.first_uncompleted_ident))
+            self.q.send(messages.Status(self.first_uncompleted_ident))
             self.last_send_status = self.first_uncompleted_ident
             logger.info("updating last send status %s", self.last_send_status)
 
@@ -470,11 +369,5 @@ def worker_main(_restartable):
         worker.event_loop()
         if not _restartable:
             break
-        q.send(Restarted(0))
+        q.send(messages.Restarted(0))
         logger.info("restarting")
-
-
-# 1. Test the mesh movement implementation for correctness
-# 2. figure out how to move the 'success' criteria for fetch_shard to the controller
-#    so it can be aware of any errors that happened on other workers. We may need to
-#    broadcast a status/response call.
