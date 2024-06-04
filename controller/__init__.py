@@ -1,5 +1,5 @@
 from supervisor import ProcessList, Context, Host, FunctionCall, TTL
-from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple, Callable
+from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple
 from torch.utils._python_dispatch import TorchDispatchMode
 from concurrent.futures import ThreadPoolExecutor
 from .tree import flatten, tree_map
