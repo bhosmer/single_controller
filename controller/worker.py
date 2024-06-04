@@ -107,6 +107,7 @@ class SendTensor(NamedTuple):
     stream: Any
 
 class Reduce(NamedTuple):
+    result: int
     local_tensor_ref: Any
     factory: 'TensorFactory'
     source_mesh_ref: Any
@@ -334,46 +335,56 @@ class Worker:
         if b is not None:
             b.drop()
 
-    def Reduce(self, local_tensor_ref: Ref, factory: TensorFactory, source_mesh_ref: Ref, stream_ref: Ref, dim: str, reduction: str, scatter: bool, inplace: bool):
+    def _reduce(self, local_tensor: torch.Tensor, source_mesh: DeviceMesh, dim: str, reduction: str, scatter: bool, inplace: bool):
+        group = source_mesh.dims[dim].process_group
+
+        if reduction == 'stack':
+            if scatter:
+                output = local_tensor
+                if not inplace:
+                    output = local_tensor.clone()
+                torch.distributed.all_to_all_single(output, local_tensor, group=group)
+                return output
+
+            assert not inplace
+            output = torch.empty([source_mesh.dims[dim].size, *local_tensor.shape],
+                                dtype=local_tensor.dtype, device=local_tensor.device, layout=local_tensor.layout)
+            print(output.shape, local_tensor.shape)
+            torch.distributed.all_gather_into_tensor(output, local_tensor, group=group)
+            return output
+
+        op = getattr(torch.distributed.ReduceOp, reduction.upper())
+
+        if scatter:
+            assert not inplace
+            output = torch.empty(local_tensor.shape[1:], dtype=local_tensor.dtype,
+                                device=local_tensor.device, layout=local_tensor.layout)
+            torch.distributed.reduce_scatter_tensor(output, local_tensor, op=op, group=group)
+            return output
+
+        output = local_tensor
+        if not inplace:
+            output = local_tensor.clone()
+        torch.distributed.all_reduce(output, op=op, group=group)
+        return output
+
+    def Reduce(self, result: int, local_tensor_ref: Ref, factory: TensorFactory, source_mesh_ref: Ref, stream_ref: Ref, dim: str, reduction: str, scatter: bool, inplace: bool):
         source_mesh = self.lookup(source_mesh_ref)
         stream = self.lookup(stream_ref)
         with stream.enable():
             try:
                 local_tensor = self.lookup(local_tensor_ref)
-            except DependentOnError:
+            except DependentOnError as e:
                 # even if we were broken before, we have to participate in the collective
-                # because cannot signal to other ranks that we were broken
+                # because we cannot signal to other ranks that we were broken
+                # the controller will see the error message we sent before and know
+                # the downstream values are broken.
                 local_tensor = factory.zeros()
-            group = source_mesh.dims[dim].process_group
-
-            if reduction == 'stack':
-                if scatter:
-                    output = local_tensor
-                    if not inplace:
-                        output = local_tensor.clone()
-                    torch.distributed.all_to_all_single(output, local_tensor, group=group)
-                    return output
-                assert not inplace
-                output = torch.empty([source_mesh.dims[dim].size, *local_tensor.shape],
-                                    dtype=local_tensor.dtype, device=local_tensor.device, layout=local_tensor.layout)
-                print(output.shape, local_tensor.shape)
-                torch.distributed.all_gather_into_tensor(output, local_tensor, group=group)
-                return output
-
-            op = getattr(torch.distributed.ReduceOp, reduction.upper())
-
-            if scatter:
-                assert not inplace
-                output = torch.empty(local_tensor.shape[1:], dtype=local_tensor.dtype,
-                                    device=local_tensor.device, layout=local_tensor.layout)
-                torch.distributed.reduce_scatter_tensor(output, local_tensor, op=op, group=group)
-                return output
-
-            output = local_tensor
-            if not inplace:
-                output = local_tensor.clone()
-            torch.distributed.all_reduce(output, op=op, group=group)
-            return output
+            # XXX - we should be careful about starting the collective with a tensor that doesn't match the expected
+            # factory size. It can error. however, before we can do something about it we need to assign a failure
+            # identity to this reduce object.
+            output = self._reduce(local_tensor, source_mesh, dim, reduction, scatter, inplace)
+            self.define(result, output)
 
     def SendTensor(self, result: int, from_ranks: List[int], to_ranks: List[int], tensorref: Ref, factory: TensorFactory, streamref):
         try:

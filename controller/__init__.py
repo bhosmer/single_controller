@@ -588,14 +588,14 @@ class Tensor(Referenceable, BaseTensor):
         """
         return MeshSliceTensor(self, self.mesh).to_mesh(mesh)
 
-    def reduce_(self, dim: str, reduction: Literal["gather", "sum", "max"], scatter=False, mesh=None):
+    def reduce_(self, dim: str, reduction: Literal["gather", "sum", "max"] = "sum", scatter=False, mesh=None):
         # TODO: checks that this can actually happen in place e.g. if scatter is True, operation must be gather.
         inplace_valid = (reduction == 'gather' and scatter) or not scatter
         if not inplace_valid:
             raise ValueError(f'reduction {reduction} is not valid for in-place operation because the output size will not match the input size')
         return self.reduce(dim, reduction, scatter, mesh, _inplace=True)
 
-    def reduce(self, dim: str, reduction: Literal["gather", "sum", "max"], scatter=False, mesh=None, _inplace=False):
+    def reduce(self, dim: str, reduction: Literal["gather", "sum", "max"] = "sum", scatter=False, mesh=None, _inplace=False):
         """
         Perform a reduction operation along dim, and move the data to mesh. If mesh=None, then mesh=self.mesh
         'gather' will concat the values along dim, and produce a local result tensor with an addition outer dimension of len(dim).
@@ -651,8 +651,8 @@ class Tensor(Referenceable, BaseTensor):
             fake_output = self._fake
         else:
             fake_output = self.mesh.ctrl._run_fake(_fake_reduce, (self._fake, self.mesh, dim, reduction, scatter), {})
-        self.mesh._send(worker.Reduce(self, self._factory(), self.mesh, self.stream, dim, reduction, scatter, _inplace))
         r = Tensor(fake_output, self.mesh, self.stream, borrowed=False)
+        self.mesh._send(worker.Reduce(r.ref, self, self._factory(), self.mesh, self.stream, dim, reduction, scatter, _inplace))
         self.mesh.ctrl.history.invocation((r,), (self,))
         return r
 

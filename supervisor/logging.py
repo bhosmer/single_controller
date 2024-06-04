@@ -44,8 +44,8 @@ class _Formatter(logging.Formatter):
 
         lines = message.strip().split("\n")
         if record.exc_info:
-            exc_info = fix_exception_lines(self.formatException(record.exc_info))
-            lines.extend(exc_info.strip().split("\n"))
+            exc_info = fix_exception_lines(self.formatException(record.exc_info).split('\n'))
+            lines.extend(exc_info)
         if record.stack_info:
             stack_info = self.formatStack(record.stack_info)
             lines.extend(stack_info.strip().split("\n"))

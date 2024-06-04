@@ -31,7 +31,7 @@ def rlist(elem):
     return elem
 
 @remote_function('controller._test_remote_functions.do_bogus_tensor_work')
-def do_bogus_tensor_work(x, y):
+def do_bogus_tensor_work(x, y, fail_rank=None):
     return x + y  # real function actually does x @ y
 
 
@@ -220,6 +220,31 @@ class TestController(TestCase):
                 r = fetch_shard(a).result(timeout=10)
             # but values not dependent on z are fine
             fetch_shard(b).result(timeout=10)
+
+    def test_distributed_error(self):
+        with self.local_device_mesh(2, 2) as device_mesh:
+            x = torch.rand(3, 4).cuda()
+            y = torch.rand(3, 4).cuda()
+            # z is broken on rank 1 but not others
+            z = do_bogus_tensor_work(x, y, fail_rank=1)
+            # test that rank 1 is still doing work despite z failing
+            a = (x + y).reduce('gpu')
+            fetch_shard(a).result()
+            # but z itself should fail, even if we do not fetch it from rank 1
+            # (since fetch shard says we first want to assert the whole tensor is correct)
+            with self.assertRaisesRegex(RemoteException, 'do_bogus_tensor_work'):
+                fetch_shard(z).result()
+            # try to reduce z, which should fail, but ranks that are not 1 do not 
+            # know about the failure. Rank 1 should still participate in the reduce
+            # to unblock work.
+            rz = z.reduce('gpu')
+            # but we should see the error message still retrieving it because it is
+            # dependent on an error.
+            with self.assertRaisesRegex(RemoteException, 'do_bogus_tensor_work'):
+                fetch_shard(rz).result()
+            # however, we should still be able to compute and get a result back
+            # from host 1, signaling that the reduction didn't get cuda compute stuck.
+            fetch_shard(2*x, {'gpu': 1, 'host': 0}).result()
 
     def test_future(self):
         the_time = 0
