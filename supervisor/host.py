@@ -135,7 +135,7 @@ class Host:
         # all processes on this host will use the same
         # socket.
         self.proc_comm: zmq.Socket = self.context.socket(zmq.ROUTER)
-        self.proc_addr = f"ipc://{uuid.uuid4()}"
+        self.proc_addr = f"ipc:///tmp/proc-{uuid.uuid4()}"
         self.proc_comm.bind(self.proc_addr)
         self.poller.register(self.proc_comm, zmq.POLLIN)
 
