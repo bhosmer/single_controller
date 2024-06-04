@@ -15,6 +15,9 @@ from . import messages
 from .reference import Referenceable
 from .history import _History, RemoteException, _Invocation
 from .borrows import _Borrows, _Borrow
+from .stream import Stream, active_stream
+from . import stream
+
 from collections import defaultdict
 import itertools
 import socket
@@ -59,8 +62,7 @@ class _Controller:
         self.allocation_borrows: WeakKeyDictionary[torch.UntypedStorage, _Borrows] = WeakKeyDictionary()
         self.fake_mode_worker = ThreadPoolExecutor(max_workers=1)
         self.history = _History(len(self.all_processes))
-        global _active_stream
-        _active_stream = Stream("main", _default=True)
+        stream._active = Stream("main", _default=True)
 
     def _run_fake(self, func, args, kwargs):
         def work():
@@ -148,7 +150,7 @@ class _Controller:
         self.history.rank_completed(proc.rank, first_uncompleted_ident)
  
 def remote_function(path: str):
-    return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active_mesh, _active_stream, func)
+    return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active_mesh, stream._active, func)
 
 def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: Optional[str] = None):
     """
@@ -159,11 +161,11 @@ def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: O
         preprocess - an optional specifier for a remote function that is applyied to obj before returning the value.
                      This can be used to turn the tensor into some non-tensor values before copying it back
     """
-    tensors, _ = dtensor_check('fetch_shard', (obj,), {}, _active_mesh, _active_stream)
+    tensors, _ = dtensor_check('fetch_shard', (obj,), {}, _active_mesh, stream._active)
     fut = Future(_active_mesh.ctrl)
     ident = _active_mesh.ctrl.history.ident((), tensors, fut)
     process = _active_mesh._process(coordinates)
-    process.send(messages.FetchValue(ident, preprocess, obj, _active_stream))
+    process.send(messages.FetchValue(ident, preprocess, obj, stream._active))
     return fut
 
 
@@ -293,77 +295,6 @@ def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=No
     ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
     return DeviceMesh(ctrl, ctrl.all_processes, {'host': len(ctrl.all_processes) // gpu_per_host, 'gpu': gpu_per_host})
 
-class Stream(Referenceable):
-    name: str
-
-    def __init__(self, name: str, _default=False):
-        self.name = name
-        self.default = _default
-        self.ctrl = None
-        self.ref = None
-
-    def __repr__(self):
-        return f'<Stream({repr(self.name)}) at {hex(id(self))}>'
-
-    def __str__(self):
-        return f'stream {repr(self.name)}'
-
-    def _use_controller(self, ctrl: '_Controller'):
-        if self.ctrl is None:
-            self.ctrl = ctrl
-        elif self.ctrl is not ctrl:
-            raise TypeError('DeviceMesh and stream controller are different.')
-
-    def delete_ref(self, ref):
-        # streams are not frequently created/destroyed so
-        # no need to buffer the delets
-        assert self.ctrl is not None
-        if not self.ctrl._shutdown:
-            self.ctrl.all_processes.send(messages.DeleteRefs([ref]))
-
-    def define_ref(self):
-        assert self.ctrl is not None
-        r = self.ctrl.ref()
-        self.ctrl.all_processes.send(messages.CreateStream(r, self.default))
-        return r
-
-    @contextmanager
-    def coalesce(self):
-        """
-        Delay issuing operators to this stream, grouping them into one big operation that will run once this context manager exits.
-        For data movement, this allows us to group the operators together. However coalescing too many ops together will expose
-        more scheduling overhead that is normally pipelined with work. So avoid globally coalescing huge parts of a network.
-        """
-        raise NotImplementedError()
-
-    def borrow(self, t: 'Tensor', mutable: bool = False) -> 'Tensor':
-        """
-        Borrows tensor 't' for use on this stream.
-        The memory of t will stay alive until t.drop() is called, which will free t and
-        and any of its alises on stream `self` and will cause t.stream to wait on self at that point so
-        that the memory of t can be reused.
-
-        If `mutable` then self can write to the storage of `t`, but t.stream cannot read or write `t` until,
-        the borrow is returned (becomes free and a wait_for has been issued).
-
-        If not `mutable` both `self` and `t.stream` can read from t's storage but neither can write to it.
-        """
-        self._use_controller(t.mesh.ctrl)
-        assert self.ctrl is not None
-        borrows = t._borrows
-        if mutable and borrows.active:
-            raise RuntimeError(f"Cannot borrow this tensor mutably because it (or a view) is already being borrowed non-mutably.")
-
-        already_borrowed = self in borrows.active
-        r = Tensor(t._fake, t.mesh, self, True)
-        self.ctrl.history.invocation((r,), (t,))
-        assert r.ref is not None
-        t.mesh._send(messages.BorrowCreate(r.ref, t, t.stream, self, already_borrowed))
-        if not already_borrowed:
-            borrows.active[self] = _Borrow(r.ref, False, traceback.extract_stack())
-            borrows.writing_stream = self if mutable else None
-        return r
-
 
 class TensorOptions(TypedDict, total=False):
     dtype: 'torch.dtype'
@@ -422,7 +353,7 @@ class Tensor(Referenceable, BaseTensor):
         else:
             function = func
 
-        return dtensor_dispatch(function, args, kwargs, _active_mesh, _active_stream, func)
+        return dtensor_dispatch(function, args, kwargs, _active_mesh, stream._active, func)
 
     def __init__(self, fake: torch.Tensor, mesh: DeviceMesh, stream: Stream, borrowed: bool):
         pass
@@ -598,7 +529,7 @@ class MeshSliceTensor:
 
         from_ranks = [p.rank for p in self.slicing.processes]
         to_ranks = [p.rank for p in mesh.processes]
-        r = Tensor(self.tensor._fake, mesh, _active_stream, False)
+        r = Tensor(self.tensor._fake, mesh, stream._active, False)
         combined_processes.send(messages.SendTensor(r.ref, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
         self.tensor.mesh.ctrl.history.invocation((r,), (self.tensor,))
         return r
@@ -699,7 +630,6 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
     return results
 
 
-_active_stream: Stream = Stream('main')
 _active_mesh: Optional[DeviceMesh] = None
 _dispatch_enabled = False
 
@@ -725,15 +655,6 @@ def _dispatch():
                 yield
         finally:
             _dispatch_enabled = False
-
-@contextmanager
-def active_stream(stream: Stream):
-    global _active_stream
-    _active_stream, old = stream, _active_stream
-    try:
-        yield
-    finally:
-        _active_stream = old
 
 @contextmanager
 def active_mesh(mesh: Optional[DeviceMesh]):

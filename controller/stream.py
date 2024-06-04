@@ -1,0 +1,88 @@
+from contextlib import contextmanager
+from . import messages
+from .reference import Referenceable
+from .borrows import _Borrow
+import traceback
+
+class Stream(Referenceable):
+    name: str
+
+    def __init__(self, name: str, _default=False):
+        self.name = name
+        self.default = _default
+        self.ctrl = None
+        self.ref = None
+
+    def __repr__(self):
+        return f'<Stream({repr(self.name)}) at {hex(id(self))}>'
+
+    def __str__(self):
+        return f'stream {repr(self.name)}'
+
+    def _use_controller(self, ctrl: '_Controller'):
+        if self.ctrl is None:
+            self.ctrl = ctrl
+        elif self.ctrl is not ctrl:
+            raise TypeError('DeviceMesh and stream controller are different.')
+
+    def delete_ref(self, ref):
+        # streams are not frequently created/destroyed so
+        # no need to buffer the delets
+        assert self.ctrl is not None
+        if not self.ctrl._shutdown:
+            self.ctrl.all_processes.send(messages.DeleteRefs([ref]))
+
+    def define_ref(self):
+        assert self.ctrl is not None
+        r = self.ctrl.ref()
+        self.ctrl.all_processes.send(messages.CreateStream(r, self.default))
+        return r
+
+    @contextmanager
+    def coalesce(self):
+        """
+        Delay issuing operators to this stream, grouping them into one big operation that will run once this context manager exits.
+        For data movement, this allows us to group the operators together. However coalescing too many ops together will expose
+        more scheduling overhead that is normally pipelined with work. So avoid globally coalescing huge parts of a network.
+        """
+        raise NotImplementedError()
+
+    def borrow(self, t: 'Tensor', mutable: bool = False) -> 'Tensor':
+        """
+        Borrows tensor 't' for use on this stream.
+        The memory of t will stay alive until t.drop() is called, which will free t and
+        and any of its alises on stream `self` and will cause t.stream to wait on self at that point so
+        that the memory of t can be reused.
+
+        If `mutable` then self can write to the storage of `t`, but t.stream cannot read or write `t` until,
+        the borrow is returned (becomes free and a wait_for has been issued).
+
+        If not `mutable` both `self` and `t.stream` can read from t's storage but neither can write to it.
+        """
+        self._use_controller(t.mesh.ctrl)
+        assert self.ctrl is not None
+        borrows = t._borrows
+        if mutable and borrows.active:
+            raise RuntimeError(f"Cannot borrow this tensor mutably because it (or a view) is already being borrowed non-mutably.")
+
+        already_borrowed = self in borrows.active
+        r = type(t)(t._fake, t.mesh, self, True)
+        self.ctrl.history.invocation((r,), (t,))
+        assert r.ref is not None
+        t.mesh._send(messages.BorrowCreate(r.ref, t, t.stream, self, already_borrowed))
+        if not already_borrowed:
+            borrows.active[self] = _Borrow(r.ref, False, traceback.extract_stack())
+            borrows.writing_stream = self if mutable else None
+        return r
+
+
+_active = Stream('main')
+
+@contextmanager
+def active_stream(stream: Stream):
+    global _active
+    _active, old = stream, _active
+    try:
+        yield
+    finally:
+        _active = old
