@@ -17,6 +17,22 @@ _glog_level_to_abbr = {
     "CRITICAL": "C",
 }
 
+def fix_exception_lines(tb_lines):
+    formatted_lines = []
+    for line in tb_lines:
+        # Replace the standard file and line format with the custom format
+        if line.startswith('  File'):
+            # Extract the filename and line number
+            parts = line.split(',')
+            file_info = parts[0].strip()[6:-1]  # Remove '  File "' and '"'
+            line_info = parts[1].strip()[5:]   # Remove 'line '
+            new_line = f'  File {file_info}:{line_info}'
+            if len(parts) > 2:
+                new_line += ', ' + ','.join(parts[2:]).strip()
+            formatted_lines.append(new_line)
+        else:
+            formatted_lines.append(line.strip())
+    return formatted_lines
 
 class _Formatter(logging.Formatter):
     def __init__(self, suffix):
@@ -28,7 +44,7 @@ class _Formatter(logging.Formatter):
 
         lines = message.strip().split("\n")
         if record.exc_info:
-            exc_info = self.formatException(record.exc_info)
+            exc_info = fix_exception_lines(self.formatException(record.exc_info))
             lines.extend(exc_info.strip().split("\n"))
         if record.stack_info:
             stack_info = self.formatStack(record.stack_info)

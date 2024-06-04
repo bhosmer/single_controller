@@ -1,24 +1,18 @@
-from torch import device
-from torch.types import Device
 from supervisor import ProcessList, Context, Host, FunctionCall, TTL
 from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple, Callable
 from torch.utils._python_dispatch import TorchDispatchMode
 from concurrent.futures import ThreadPoolExecutor
-from supervisor.logging import gethostname
 from .tree import flatten, tree_map
 from torch._subclasses.fake_tensor import FakeTensorMode
 from .base_tensor import BaseTensor
 
-from torch import dtype, layout, device, memory_format
 from typing_extensions import Unpack
 import torch
 from contextlib import contextmanager
 # from .base_tensor import BaseTensor
 import math
-import os
 from . import worker
-from .worker import RemoteException, Ref
-from abc import ABC, abstractmethod
+from .worker import Ref
 from collections import defaultdict, deque
 import itertools
 import socket
@@ -62,25 +56,107 @@ class _Borrows:
         # what active borrows of this exist?
         self.active: Dict['Stream', _Borrow] = {}
 
+class RemoteException(Exception):
+    def __init__(self, ident: int, exception: Exception, controller_frames: List[traceback.FrameSummary], worker_frames: List[traceback.FrameSummary]):
+        self.ident = ident
+        self.exception = exception
+        self.controller_frames = controller_frames
+        self.worker_frames = worker_frames
+
+    def __str__(self):
+        try:
+            exe = str(self.exception)
+            worker_tb = ''.join(traceback.format_list(self.worker_frames))
+            controller_tb = ''.join(traceback.format_list(self.controller_frames)) if self.controller_frames is not None else '<unset>'
+            return f'A remote function has failed asynchronously.\n' \
+                f'Traceback of where the remote function was issued on controller (most recent call last):\n{controller_tb}' \
+                f'Traceback of where the remote function failed on worker (most recent call last):\n{worker_tb}{type(self.exception).__name__}: {exe}'
+        except Exception as e:
+            print(e)
+            return "oops"
+
+class _Invocation:
+    def __init__(self, traceback: List[traceback.FrameSummary]):
+        self.traceback = traceback
+        self.users = set['_Invocation']()
+        self.failure: Optional[RemoteException] = None
+        self.fut: Optional[Future] = None
+        self.fut_value: Any = None
+ 
+    def fail(self, remote_exception: RemoteException):
+        if self.failure is None or self.failure.ident > remote_exception.ident:
+            self.failure = remote_exception
+            return True
+        return False
+        
+
+class _History:
+    def __init__(self, N):
+        self.next_ident = itertools.count()
+        self.first_uncompleted_ident = [0 for _ in range(N)]
+        self.min_first_uncompleted_ident = 0
+        self.invocations = deque[_Invocation]()
+        self.last_assigned_ident = -1
+    
+    def invocation(self, defs: Sequence['Tensor'], uses: Sequence['Tensor']):
+        r = _Invocation(traceback.extract_stack()[:-2])
+        for t in uses:
+            u = t._invocation
+            u.users.add(r)
+            if u.failure is not None:
+                r.fail(u.failure)
+        for t in defs:
+            t._invocation = r
+        return r
+
+    def ident(self, defs: Sequence['Tensor'], uses: Sequence['Tensor'], future: Optional['Future'] = None) -> int:
+        r = self.last_assigned_ident = next(self.next_ident)
+        invocation = self.invocation(defs, uses)
+        invocation.fut = future
+        self.invocations.append(invocation)
+        return r
+
+    def propagate_failure(self, ident, exception, worker_frames):
+        invocation = self.invocations[ident - self.min_first_uncompleted_ident]
+        remote_exception = RemoteException(ident, exception, invocation.traceback, worker_frames)
+        worklist = deque((invocation,))
+        while worklist:
+            invocation = worklist.popleft()
+            if invocation.fail(remote_exception):
+                worklist.extend(invocation.users)
+    
+    def rank_completed(self, rank, first_uncompleted_ident):
+        # advance what our last completed action was, and
+        # trim the list of tracebacks if we no longer need them.
+        prev = self.first_uncompleted_ident[rank]
+        self.first_uncompleted_ident[rank] = first_uncompleted_ident
+        if prev == self.min_first_uncompleted_ident:
+            self.min_first_uncompleted_ident = min(self.first_uncompleted_ident)            
+            for _ in range(self.min_first_uncompleted_ident - prev):
+                invocation = self.invocations.popleft()
+                if invocation.fut is not None:
+                    invocation.fut._set_result(invocation.fut_value if invocation.failure is None else invocation.failure)
+
+    def future_completed(self, ident, value):
+        invocation = self.invocations[ident - self.min_first_uncompleted_ident]
+        invocation.fut_value = value
+
 class _Controller:
     def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None, _store=None):
         self.ctx = ctx
         self.hosts = hosts
         self.store = self._create_store() if _store is None else _store
         self.all_processes = self._create_pg(ctx, hosts, gpu_per_host, self.store) if _processes is None else _processes
-        self.last_completed_idents = [-1 for _ in self.all_processes]
-        self.min_last_completed_ident = -1
         self.next_ref = itertools.count()
-        self.next_ident = itertools.count()
         self.exited = {}
         self.failures: Dict[int, Dict[int, RemoteException]] = defaultdict(dict)
-        self.tracebacks: deque[List[traceback.FrameSummary]] = deque()
         self.pending_del: Dict[DeviceMesh, List[int]] = defaultdict(list)
         self._shutdown = False
         self.incomplete_futures = {}
         self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
         self.allocation_borrows: WeakKeyDictionary[torch.UntypedStorage, _Borrows] = WeakKeyDictionary()
         self.fake_mode_worker = ThreadPoolExecutor(max_workers=1)
+        self.history = _History(len(self.all_processes))
         global _active_stream
         _active_stream = Stream("main", _default=True)
 
@@ -121,11 +197,6 @@ class _Controller:
     def ref(self) -> int:
         return next(self.next_ref)
 
-    def ident(self) -> int:
-        r = self.last_ident = next(self.next_ident)
-        self.tracebacks.append(traceback.extract_stack()[:-2])
-        return r
-
     def _flush_deletes(self, device_mesh: 'DeviceMesh') -> Optional[worker.DeleteRefs]:
         to_delete = None
         if device_mesh in self.pending_del:
@@ -137,17 +208,19 @@ class _Controller:
         self.pending_del.clear()
         return to_delete
 
+    def _request_status(self):
+            self.all_processes.send(worker.RequestStatus(self.history.last_assigned_ident))
+
     def _read_messages(self, timeout: Optional[float]):
-        if self.controller_status_ttl() == 0:
-            self.all_processes.send(worker.ControllerStatus(self.last_ident))
-            self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
+        # XXX - how can we avoid always requesting status when waiting on futures?
+        #       we need to figure out what submesh we need to hear from before a future
+        #       is considered 'good'. This means not just waiting for the future value
+        #       but also for signal that any failures that could invalidate the future have
+        #       not happened. We could do better if tensors/collectives had an invalid bit
+        #       that we propagate. In real uses fetches might lag behind anyway so we would not
+        #       have to send out so many requests for current status.
         for msg in self.ctx.recvready(timeout):
             self.handle_message(msg)
-
-    def future(self):
-        ident = self.ident()
-        f = self.incomplete_futures[ident] = Future(self)
-        return f, ident
 
     def handle_message(self, msg):
         sender, value = msg
@@ -163,27 +236,15 @@ class _Controller:
         self.exited[proc] = result
 
     def FetchResult(self, proc, ident, value):
-        self.incomplete_futures.pop(ident)._set_result(value)
+        self.history.future_completed(ident, value)
 
-    def FetchException(self, proc, ident, failing_ident):
-        self.incomplete_futures[ident]._set_result(self.failures[failing_ident][proc.rank])
+    def RemoteFunctionFailed(self, proc, failing_ident, exception: Exception, worker_frames: List[traceback.FrameSummary]):
+        self.history.propagate_failure(failing_ident, exception, worker_frames)
+        self.history.rank_completed(proc.rank, failing_ident)
 
-    def Status(self, proc, last_completed_ident, failed_idents):
-        # record failure messages in status report for later reporting
-        for ident, remote_exception in failed_idents.items():
-            frames = self.tracebacks[ident - (self.min_last_completed_ident + 1)]
-            remote_exception.controller_frames = frames
-            self.failures[ident][proc.rank] = remote_exception
-
-        # advance what our last completed action was, and
-        # trim the list of tracebacks if we no longer need them.
-        prev = self.last_completed_idents[proc.rank]
-        self.last_completed_idents[proc.rank] = last_completed_ident
-        if prev == self.min_last_completed_ident:
-            self.min_last_completed_ident = min(self.last_completed_idents)
-            for _ in range(self.min_last_completed_ident - prev):
-                self.tracebacks.popleft()
-
+    def Status(self, proc, first_uncompleted_ident):
+        self.history.rank_completed(proc.rank, first_uncompleted_ident)
+ 
 class Referenceable:
     def delete_ref(self, ref):
         raise NotImplementedError("no delete_ref method")
@@ -212,8 +273,9 @@ def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: O
         preprocess - an optional specifier for a remote function that is applyied to obj before returning the value.
                      This can be used to turn the tensor into some non-tensor values before copying it back
     """
-    dtensor_check('fetch_shard', (obj,), {}, _active_mesh, _active_stream)
-    fut, ident = _active_mesh.ctrl.future()
+    tensors, _ = dtensor_check('fetch_shard', (obj,), {}, _active_mesh, _active_stream)
+    fut = Future(_active_mesh.ctrl)
+    ident = _active_mesh.ctrl.history.ident((), tensors, fut)
     process = _active_mesh._process(coordinates)
     process.send(worker.FetchValue(ident, preprocess, obj, _active_stream))
     return fut
@@ -325,8 +387,7 @@ class DeviceMesh(Referenceable):
                 borrows.active[tensor.stream] = borrow._replace(used=True)
 
 
-@remote_function('controller.worker._reduce')
-def _reduce(tensor, source_mesh, dim, reduction, scatter, destination_mesh, inplace):
+def _fake_reduce(tensor, source_mesh, dim, reduction, scatter):
     if scatter:
         N = source_mesh.dims[dim]
         if tensor.ndim == 0 or tensor.size(0) != N:
@@ -345,8 +406,6 @@ def _reduce(tensor, source_mesh, dim, reduction, scatter, destination_mesh, inpl
 def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
     ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
     return DeviceMesh(ctrl, ctrl.all_processes, {'host': len(ctrl.all_processes) // gpu_per_host, 'gpu': gpu_per_host})
-
-
 
 class Stream(Referenceable):
     name: str
@@ -411,6 +470,7 @@ class Stream(Referenceable):
 
         already_borrowed = self in borrows.active
         r = Tensor(t._fake, t.mesh, self, True)
+        self.ctrl.history.invocation((r,), (t,))
         assert r.ref is not None
         t.mesh._send(worker.BorrowCreate(r.ref, t, t.stream, self, already_borrowed))
         if not already_borrowed:
@@ -586,7 +646,15 @@ class Tensor(Referenceable, BaseTensor):
             raise ValueError(f'reduction {reduction} not supported, reductions are {_valid_reduce}')
         if mesh is None:
             mesh = self.mesh
-        return _reduce(self, self.mesh, dim, reduction, scatter, mesh, _inplace)
+
+        if _inplace:
+            fake_output = self._fake
+        else:
+            fake_output = self.mesh.ctrl._run_fake(_fake_reduce, (self._fake, self.mesh, dim, reduction, scatter), {})
+        self.mesh._send(worker.Reduce(self, self._factory(), self.mesh, self.stream, dim, reduction, scatter, _inplace))
+        r = Tensor(fake_output, self.mesh, self.stream, borrowed=False)
+        self.mesh.ctrl.history.invocation((r,), (self,))
+        return r
 
     def slice_mesh(self, **kwargs: Dict[str, Union[int, slice]]) -> 'MeshSliceTensor':
         # technically a slice of a device mesh and a device mesh are not same thing
@@ -641,6 +709,7 @@ class MeshSliceTensor:
         to_ranks = [p.rank for p in mesh.processes]
         r = Tensor(self.tensor._fake, mesh, _active_stream, False)
         combined_processes.send(worker.SendTensor(r.ref, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
+        self.tensor.mesh.ctrl.history.invocation((r,), (self.tensor,))
         return r
 
 
@@ -704,6 +773,7 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
     ctrl = device_mesh.ctrl
     stream._use_controller(ctrl)
 
+    mutates = []
     if callable(result_type):
         fake_input_tensors = [d._fake for d in dtensors]
         before_versions = [f._version for f in fake_input_tensors]
@@ -718,6 +788,7 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
                              else f"it can only be mutated by f{writing_stream}"
                     tbs = ''.join(f"Traceback of borrow to {k} (most recent frame last):\n{''.join(traceback.format_list(b.frames))}" for k,b in borrows.active.items())
                     raise ValueError(f"\n{tbs}\nTensor input {i} would be mutated by this operator but {reason}")
+                mutates.extend(dtensors[i]._borrows.aliases)
         fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
     else:
         result = result_type
@@ -728,8 +799,12 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stre
     # sometimes operators return references to inputs, in which case the result should be the same DTensor object
     # otherwise we create a new DTensor with a new RemoteRef for the result
     result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream, False) for fake in fake_result_dtensors)
-    device_mesh._send(worker.CallFunction(device_mesh.ctrl.ident(), tuple(r.ref for r in result_dtensors), func, args, kwargs, stream))
+    ident = device_mesh.ctrl.history.ident(result_dtensors + tuple(mutates), dtensors)
+    device_mesh._send(worker.CallFunction(ident, tuple(r.ref for r in result_dtensors), tuple(r.ref for r in mutates), func, args, kwargs, stream))    
     results = unflatten_result(result_dtensors)
+    # XXX - realistically this would be done on a non-python thread, keeping our messages up to date
+    # but we can approximate it by checking for all ready meassages whenever we schedule new work
+    device_mesh.ctrl._read_messages(0)
     return results
 
 
@@ -802,6 +877,15 @@ class Future:
     def _wait(self, timeout: Optional[float]):
         if self._status != 'incomplete':
             return True
+        # see if the future is done already
+        # and we just haven't processed the messages
+        self._ctrl._read_messages(0)
+        if self._status != 'incomplete':
+            return True
+        # we might need to ask for status updates
+        # from workers to be sure they have finished
+        # enough work to count this future as finished.
+        self._ctrl._request_status()
         if timeout is None:
             while self._status == 'incomplete':
                 self._ctrl._read_messages(timeout=None)

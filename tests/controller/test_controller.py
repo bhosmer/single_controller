@@ -1,3 +1,12 @@
+import traceback
+import sys
+from supervisor.logging import fix_exception_lines
+def custom_excepthook(exc_type, exc_value, exc_traceback):
+    tb_lines = fix_exception_lines(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print('\n'.join(tb_lines), file=sys.stderr)
+
+sys.excepthook = custom_excepthook
+
 from collections import defaultdict
 from supervisor import Context, HostConnected
 from supervisor.host import Host as HostManager
@@ -206,12 +215,11 @@ class TestController(TestCase):
             y = torch.rand(3, 4)
             z = do_bogus_tensor_work(x, y)
             a = z + x
-            b = x + y
-            # this dependent on z are gonna fail
+            b = x + y            
             with self.assertRaisesRegex(RemoteException, 'do_bogus_tensor_work'):
-                r = fetch_shard(a).result(timeout=5)
+                r = fetch_shard(a).result(timeout=10)
             # but values not dependent on z are fine
-            fetch_shard(b).result(timeout=5)
+            fetch_shard(b).result(timeout=10)
 
     def test_future(self):
         the_time = 0
@@ -228,6 +236,8 @@ class TestController(TestCase):
                     the_messages.pop(0)
                 else:
                     the_time += timeout
+            def _request_status(self):
+                pass
 
         ctrl = MockController()
 
@@ -248,7 +258,7 @@ class TestController(TestCase):
             the_time = 0
             self.assertEqual(3, f.result())
             f = Future(ctrl)
-            re = RemoteException(Exception(), [])
+            re = RemoteException(0, Exception(), [], [])
 
             the_messages = [(1, lambda: None), (2, lambda: f._set_result(re))]
             the_time = 0

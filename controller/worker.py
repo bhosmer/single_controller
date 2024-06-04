@@ -8,7 +8,7 @@ import logging
 from .tree import flatten, tree_map
 import torch
 import torch.distributed
-from traceback import extract_tb, FrameSummary, format_list
+from traceback import extract_tb, FrameSummary
 
 logger = logging.getLogger(__name__)
 
@@ -22,26 +22,6 @@ class Ref:
     def __reduce__(self):
         return Ref, (self.id,)
 
-class RemoteException(Exception):
-    def __init__(self, exception: Exception, worker_frames: Optional[List[FrameSummary]] = None):
-        self.exception = exception
-        if worker_frames is None:
-            worker_frames = extract_tb(exception.__traceback__)
-        self.worker_frames = worker_frames
-        self.controller_frames: Optional[List[FrameSummary]] = None
-
-    def __str__(self):
-        try:
-            exe = str(self.exception)
-            worker_tb = ''.join(format_list(self.worker_frames))
-            controller_tb = ''.join(format_list(self.controller_frames)) if self.controller_frames is not None else '<unset>'
-            return f'A remote function has failed asynchronously.\n' \
-                f'Traceback of where the remote function was issued on controller (most recent call last):\n{controller_tb}' \
-                f'Traceback of where the remote function failed on worker (most recent call last):\n{worker_tb}{type(self.exception).__name__}: {exe}'
-        except Exception as e:
-            print(e)
-            return "oops"
-
 class CreateDeviceMesh(NamedTuple):
     result: int
     dims: Dict[str, int]
@@ -54,6 +34,7 @@ class CreateStream(NamedTuple):
 class CallFunction(NamedTuple):
     ident: int
     results: Tuple[int, ...]
+    mutates: Tuple[int, ...]
     function: Union[str, Callable]
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
@@ -90,19 +71,18 @@ class FetchResult(NamedTuple):
     ident: int
     value: Any
 
-class FetchException(NamedTuple):
-    ident: int
+class RemoteFunctionFailed(NamedTuple):
     failing_ident: int
+    exception: Exception
+    worker_frames: List[FrameSummary]
 
 class Status(NamedTuple):
-    last_completed_ident: int
-    failed_idents: Dict[int, RemoteException]  # since last status
+    first_uncompleted_ident: int
 
-# used to force ident to update periodically even
-# if this particular worker has received no new work
-# eventually can be used to send more status info
-# to workers
-class ControllerStatus(NamedTuple):
+# When the controller is waiting on a status update,
+# it will request one even if it is before the
+# periodic one.
+class RequestStatus(NamedTuple):
     ident: int
 
 class BorrowCreate(NamedTuple):
@@ -125,6 +105,16 @@ class SendTensor(NamedTuple):
     tensor: Any
     factory: 'TensorFactory'
     stream: Any
+
+class Reduce(NamedTuple):
+    local_tensor_ref: Any
+    factory: 'TensorFactory'
+    source_mesh_ref: Any
+    stream_ref: Any
+    dim: str
+    reduction: str
+    scatter: bool
+    inplace: bool
 
 class TensorFactory(NamedTuple):
     size: Tuple[int,...]
@@ -158,42 +148,6 @@ class DeviceMesh:
             objects.append(Dim(rank, size, process_group))
             stride *= size
         self.dims = dict(zip(dims.keys(), reversed(objects)))
-
-
-def _reduce(local_tensor, source_mesh: 'DeviceMesh', dim: str, reduction: str, scatter: bool, destination_mesh: 'DeviceMesh', inplace: bool):
-    if destination_mesh is None:
-        destination_mesh = source_mesh
-    group = source_mesh.dims[dim].process_group
-    assert source_mesh is destination_mesh
-
-    if reduction == 'stack':
-        if scatter:
-            output = local_tensor
-            if not inplace:
-                output = local_tensor.clone()
-            torch.distributed.all_to_all_single(output, local_tensor, group=group)
-            return output
-        assert not inplace
-        output = torch.empty([source_mesh.dims[dim].size, *local_tensor.shape],
-                             dtype=local_tensor.dtype, device=local_tensor.device, layout=local_tensor.layout)
-        print(output.shape, local_tensor.shape)
-        torch.distributed.all_gather_into_tensor(output, local_tensor, group=group)
-        return output
-
-    op = getattr(torch.distributed.ReduceOp, reduction.upper())
-
-    if scatter:
-        assert not inplace
-        output = torch.empty(local_tensor.shape[1:], dtype=local_tensor.dtype,
-                             device=local_tensor.device, layout=local_tensor.layout)
-        torch.distributed.reduce_scatter_tensor(output, local_tensor, op=op, group=group)
-        return output
-
-    output = local_tensor
-    if not inplace:
-        output = local_tensor.clone()
-    torch.distributed.all_reduce(output, op=op, group=group)
-    return output
 
 def _rank(mesh: 'DeviceMesh', dim: str):
     return torch.full((), mesh.dims[dim].rank, dtype=torch.long)
@@ -262,10 +216,9 @@ class Worker:
         self.rank = rank
         self.world = world
         self.local_rank = local_rank
-        self.last_completed_ident = -1
-        self.last_send_status = -1
-        self.failed_idents: Dict[int, RemoteException] = {}
-        self.borrows: Dict[int, Borrow] = {}
+        self.first_uncompleted_ident = 0
+        self.last_send_status = 0
+        self.borrows: Dict[int, Optional[Borrow]] = {}
 
     def handle_message(self, event: NamedTuple):
         cmd = event.__class__.__name__
@@ -299,15 +252,8 @@ class Worker:
             function = getattr(module, funcname)
         return function
 
-    def _dependent_error(self, ident: int, exception: Exception) -> DependentOnError:
-        if isinstance(exception, DependentOnError):
-            return exception
-        self.failed_idents[ident] = RemoteException(exception)
-        exception = DependentOnError(ident)
-        return exception
-
-    def CallFunction(self, ident: int, results: Tuple[int], function: Union[str, Callable], args: Tuple[Any, ...], kwargs: Dict[str, Any], streamref: Ref):
-        try:
+    def CallFunction(self, ident: int, results: Tuple[int], mutates: Tuple[int], function: Union[str, Callable], args: Tuple[Any, ...], kwargs: Dict[str, Any], streamref: Ref):
+        with self.try_define(ident, results + mutates):
             stream: Stream = self.lookup(streamref)
             args, kwargs = tree_map(self.lookup, (args, kwargs))
             if isinstance(function, str):
@@ -318,19 +264,29 @@ class Worker:
             assert len(results) == len(tensors)
             for r, t in zip(results, tensors):
                 self.define(r, t)
-        except Exception as e:
-            err = self._dependent_error(ident, e)
-            for r in results:
-                self.define(r, err)
-        finally:
-            self.last_completed_ident = ident
 
     def CreateStream(self, result: int, default: bool):
         self.define(result, Stream(default))
 
-    def FetchValue(self, ident: int, function_str: Optional[str], obj: Any, streamref: Ref):
-        self.last_completed_ident = ident
+    @contextmanager
+    def try_define(self, ident: int, results: Tuple[int, ...]):
         try:
+            yield
+        except DependentOnError as e:
+            for r in results:
+                self.define(r, e)
+            # note: there is no need to to send RemoteFunctionFailed
+            # because the controller would have already gotten and propagated the
+            # original created of DependentOnError.
+        except Exception as e:
+            exc = DependentOnError(ident)
+            for r in results:
+                self.define(r, exc)
+            self.q.send(RemoteFunctionFailed(ident, e, extract_tb(e.__traceback__)))
+        self.first_uncompleted_ident = ident + 1          
+
+    def FetchValue(self, ident: int, function_str: Optional[str], obj: Any, streamref: Ref):
+        with self.try_define(ident, ()):
             stream: Stream = self.lookup(streamref)
             obj = tree_map(self.lookup, obj)
             with stream.enable():
@@ -338,17 +294,10 @@ class Worker:
                     function = self._resolve_function(function_str)
                     obj = function(obj)
                 self.q.send(FetchResult(ident, obj))
-        except Exception as e:
-            err = self._dependent_error(ident, e)
-            # make sure controller knows the error message
-            # if we have not already reported it.
-            if err.ident in self.failed_idents:
-                self._send_status()
-                assert err.ident not in self.failed_idents
-            self.q.send(FetchException(ident, err.ident))
 
-    def ControllerStatus(self, ident: int):
-        self.last_completed_ident = ident
+    def RequestStatus(self, ident: int):
+        self.first_uncompleted_ident = ident + 1
+        self._send_status()
 
     def Exit(self):
         raise StopIteration()
@@ -366,18 +315,65 @@ class Worker:
             from_stream = self.lookup(from_streamref)
             to_stream = self.lookup(to_streamref)
             tensor = self.lookup(tensorref)
+            self.define(result, tensor)
+            if not already_borrowed:
+                self.borrows[result] = Borrow(from_stream, to_stream)
         except DependentOnError as e:
             self.define(result, e)
-            return
-        self.define(result, tensor)
-        if not already_borrowed:
-            self.borrows[result] = Borrow(from_stream, to_stream)
+            if not already_borrowed:
+                self.borrows[result] = None
 
     def BorrowFirstUse(self, borrow: int):
-        self.borrows[borrow].use()
+        b = self.borrows[borrow]
+        # can be none if the originator of the borrow errored.
+        if b is not None:
+            b.use()
 
     def BorrowDrop(self, borrow: int):
-        self.borrows.pop(borrow).drop()
+        b = self.borrows.pop(borrow)
+        if b is not None:
+            b.drop()
+
+    def Reduce(self, local_tensor_ref: Ref, factory: TensorFactory, source_mesh_ref: Ref, stream_ref: Ref, dim: str, reduction: str, scatter: bool, inplace: bool):
+        source_mesh = self.lookup(source_mesh_ref)
+        stream = self.lookup(stream_ref)
+        with stream.enable():
+            try:
+                local_tensor = self.lookup(local_tensor_ref)
+            except DependentOnError:
+                # even if we were broken before, we have to participate in the collective
+                # because cannot signal to other ranks that we were broken
+                local_tensor = factory.zeros()
+            group = source_mesh.dims[dim].process_group
+
+            if reduction == 'stack':
+                if scatter:
+                    output = local_tensor
+                    if not inplace:
+                        output = local_tensor.clone()
+                    torch.distributed.all_to_all_single(output, local_tensor, group=group)
+                    return output
+                assert not inplace
+                output = torch.empty([source_mesh.dims[dim].size, *local_tensor.shape],
+                                    dtype=local_tensor.dtype, device=local_tensor.device, layout=local_tensor.layout)
+                print(output.shape, local_tensor.shape)
+                torch.distributed.all_gather_into_tensor(output, local_tensor, group=group)
+                return output
+
+            op = getattr(torch.distributed.ReduceOp, reduction.upper())
+
+            if scatter:
+                assert not inplace
+                output = torch.empty(local_tensor.shape[1:], dtype=local_tensor.dtype,
+                                    device=local_tensor.device, layout=local_tensor.layout)
+                torch.distributed.reduce_scatter_tensor(output, local_tensor, op=op, group=group)
+                return output
+
+            output = local_tensor
+            if not inplace:
+                output = local_tensor.clone()
+            torch.distributed.all_reduce(output, op=op, group=group)
+            return output
 
     def SendTensor(self, result: int, from_ranks: List[int], to_ranks: List[int], tensorref: Ref, factory: TensorFactory, streamref):
         try:
@@ -422,10 +418,9 @@ class Worker:
         self.env[r] = value
 
     def _send_status(self):
-        if self.last_completed_ident > self.last_send_status:
-            self.q.send(Status(self.last_completed_ident, self.failed_idents))
-            self.failed_idents.clear()
-            self.last_send_status = self.last_completed_ident
+        if self.first_uncompleted_ident > self.last_send_status:
+            self.q.send(Status(self.first_uncompleted_ident))
+            self.last_send_status = self.first_uncompleted_ident
             logger.info("updating last send status %s", self.last_send_status)
 
     def event_loop(self):
