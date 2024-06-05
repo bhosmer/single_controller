@@ -1,8 +1,93 @@
 import os
+from contextlib import ExitStack, contextmanager
+from weakref import WeakKeyDictionary
+from supervisor import Context, HostConnected
+from supervisor.host import Host as HostManager
+from functools import partial, cache
+from threading import Thread
+from controller.controller import Controller
+from controller import world_mesh, active_mesh
+import signal
+from time import sleep
 
 # code used for testing but useful to have importable (e.g. can refer to remote functions)
-
 def do_bogus_tensor_work(x, y, fail_rank=None):
     if fail_rank is not None and int(os.environ["RANK"]) != fail_rank:
         return x
     return x @ y
+
+class LocalContext:
+    def __init__(self):
+        self._all_hosts = WeakKeyDictionary()
+        self.cleanup = ExitStack()
+        self._process_cache = {}
+
+    @contextmanager
+    def _get_context(self, N, gpu_per_host):
+        ctx = Context()
+        ctx.request_hosts(N)
+        threads = []
+        # we want ctx to start its listener threads
+        # before creating the hosts because
+        # initialization will happen faster in this case
+        sleep(0)
+
+        def run_host(host: HostManager):
+            try:
+                host.run_event_loop_forever()
+            except SystemExit:
+                pass
+
+        for _ in range(N):
+            host = HostManager("tcp://127.0.0.1:55555")
+            self._all_hosts[host] = True
+            thread = Thread(target=partial(run_host, host))
+            thread.start()
+            threads.append(thread)
+
+        connections = ctx.messagefilter(HostConnected)
+        hosts = [connections.recv(timeout=1).sender for _ in range(N)]
+        store = Controller._create_store()
+        processes = Controller._create_pg(ctx, hosts, gpu_per_host, store, _restartable=True)
+        yield ctx, hosts, processes
+        for p in processes:
+            p.signal(signal.SIGTERM)
+        ctx.shutdown()
+        for th in threads:
+            th.join(timeout=1)
+            if th.is_alive():
+                raise TimeoutError()
+
+    def _processes(self, N, gpu_per_host):
+        print(self._process_cache)
+        key = (N, gpu_per_host)
+        if key not in self._process_cache:
+            print(key)
+            self._process_cache[key] = self.cleanup.enter_context(self._get_context(N, gpu_per_host))
+        print("AFTER UPDATE", self._process_cache)
+        return self._process_cache[key]
+    
+    def close(self):
+        self.cleanup.close()
+    
+    def interrupt(self):
+        for host in self._all_hosts.keys():
+            for proc in host.process_table.values():
+                os.killpg(proc.subprocess.pid, signal.SIGKILL)
+
+    @contextmanager
+    def local_device_mesh(self, N, gpu_per_host, activate=True):
+        ctx, hosts, processes = self._processes(N, gpu_per_host)
+        dm = world_mesh(ctx, hosts, gpu_per_host, _processes=processes)
+        if activate:
+            with active_mesh(dm):
+                yield dm
+        else:
+            yield dm
+        dm.ctrl.shutdown()
+
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        self.cleanup.close()
