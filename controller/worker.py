@@ -238,7 +238,6 @@ class Worker:
             assert not inplace
             output = torch.empty([source_mesh.dims[dim].size, *local_tensor.shape],
                                  dtype=local_tensor.dtype, device=local_tensor.device, layout=local_tensor.layout)
-            print(output.shape, local_tensor.shape)
             torch.distributed.all_gather_into_tensor(output, local_tensor, group=group)
             return output
 
@@ -322,7 +321,6 @@ class Worker:
         if self.first_uncompleted_ident > self.last_send_status:
             self.q.send(messages.Status(self.first_uncompleted_ident))
             self.last_send_status = self.first_uncompleted_ident
-            logger.info("updating last send status %s", self.last_send_status)
 
     def event_loop(self):
         STATUS_INTERVAL = 1.0

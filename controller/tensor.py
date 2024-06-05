@@ -54,7 +54,7 @@ class Tensor(Referenceable, BaseTensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        raise ValueError('distributed Tensor used when no device mesh is active.')
+        return dtensor_dispatch(func, args, kwargs, None, stream._active, func)
 
     def __init__(self, fake: torch.Tensor, mesh: 'DeviceMesh', stream: Stream, borrowed: bool):
         pass
@@ -316,6 +316,8 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional['DeviceMesh'], st
         func = "torch.ops." + str(func)
     dtensors, unflatten = dtensor_check(func, args, kwargs, device_mesh, stream)
     assert device_mesh is not None
+    if device_mesh is None:
+        raise ValueError("Remote functions require an active device mesh (use `with active_mesh(mesh):`")
     ctrl = device_mesh.ctrl
     stream._use_controller(ctrl)
 

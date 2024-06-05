@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import torch
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import math
 from . import messages
 from .reference import Referenceable
@@ -119,6 +119,14 @@ class DeviceMesh(Referenceable):
                 self._send(messages.BorrowFirstUse(borrow.id))
                 borrows.active[tensor.stream] = borrow._replace(used=True)
 
+    def activate(self):
+        self._activated = active_mesh(self)
+        self._activated.__enter__()
+        assert _active is not None
+        assert _dispatch_enabled
+    
+    def deactivate(self):
+        self._activated.__exit__(None, None, None)
 
 _active: Optional[DeviceMesh] = None
 _dispatch_enabled = False

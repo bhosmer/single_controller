@@ -51,6 +51,9 @@ def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=No
     ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
     return DeviceMesh(ctrl, ctrl.all_processes, {'host': len(ctrl.all_processes) // gpu_per_host, 'gpu': gpu_per_host})
 
+def get_active_stream():
+    return stream._active
+
 
 __all__ = [
     'RemoteException',
@@ -61,4 +64,5 @@ __all__ = [
     'DeviceMesh',
     'Tensor',
     'Stream',
+    'get_active_stream',
 ]

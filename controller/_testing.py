@@ -9,12 +9,22 @@ from controller.controller import Controller
 from controller import world_mesh, active_mesh
 import signal
 from time import sleep
+import logging
+import torch
+
+logger = logging.getLogger(__name__)
 
 # code used for testing but useful to have importable (e.g. can refer to remote functions)
 def do_bogus_tensor_work(x, y, fail_rank=None):
     if fail_rank is not None and int(os.environ["RANK"]) != fail_rank:
         return x
     return x @ y
+
+def log(*args, **kwargs):
+    logger.info(*args, **kwargs)
+
+def has_nan(t):
+    return torch.isnan(t).any().item()
 
 class LocalContext:
     def __init__(self):
@@ -59,12 +69,9 @@ class LocalContext:
                 raise TimeoutError()
 
     def _processes(self, N, gpu_per_host):
-        print(self._process_cache)
         key = (N, gpu_per_host)
         if key not in self._process_cache:
-            print(key)
             self._process_cache[key] = self.cleanup.enter_context(self._get_context(N, gpu_per_host))
-        print("AFTER UPDATE", self._process_cache)
         return self._process_cache[key]
     
     def close(self):
@@ -91,3 +98,19 @@ class LocalContext:
     
     def __exit__(self, *args):
         self.cleanup.close()
+
+
+def _example_mesh(hosts: int, gpus: int):
+    with LocalContext() as c, c.local_device_mesh(2, 2, activate=False) as dm:
+        yield dm
+
+def example_mesh(hosts: int, gpus: int):
+    it = _example_mesh(hosts, gpus)
+    dm = next(it)
+    def exit():
+        try:
+            next(it)
+        except StopIteration:
+            pass
+    dm.exit = exit
+    return dm
