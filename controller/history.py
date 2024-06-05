@@ -25,10 +25,10 @@ class RemoteException(Exception):
             print(e)
             return "oops"
 
-class _Invocation:
+class Invocation:
     def __init__(self, traceback: List[traceback.FrameSummary]):
         self.traceback = traceback
-        self.users = set['_Invocation']()
+        self.users = set['Invocation']()
         self.failure: Optional[RemoteException] = None
         self.fut: Optional['Future'] = None
         self.fut_value: Any = None
@@ -39,16 +39,16 @@ class _Invocation:
             return True
         return False
 
-class _History:
+class History:
     def __init__(self, N):
         self.next_ident = itertools.count()
         self.first_uncompleted_ident = [0 for _ in range(N)]
         self.min_first_uncompleted_ident = 0
-        self.invocations = deque[_Invocation]()
+        self.invocations = deque[Invocation]()
         self.last_assigned_ident = -1
 
     def invocation(self, defs: Sequence['Tensor'], uses: Sequence['Tensor']):
-        r = _Invocation(traceback.extract_stack()[:-2])
+        r = Invocation(traceback.extract_stack()[:-2])
         for t in uses:
             u = t._invocation
             assert u is not None

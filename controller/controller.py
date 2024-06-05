@@ -7,8 +7,8 @@ import torch
 import torch.distributed
 from torch.distributed import TCPStore
 from . import messages, stream
-from .history import _History, RemoteException
-from .borrows import _Borrows
+from .history import History, RemoteException
+from .borrows import Borrows
 from .stream import Stream
 from .device_mesh import DeviceMesh
 
@@ -49,9 +49,9 @@ class Controller:
         self._shutdown = False
         self.incomplete_futures = {}
         self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
-        self.allocation_borrows: WeakKeyDictionary[torch.UntypedStorage, _Borrows] = WeakKeyDictionary()
+        self.allocation_borrows: WeakKeyDictionary[torch.UntypedStorage, Borrows] = WeakKeyDictionary()
         self.fake_mode_worker = ThreadPoolExecutor(max_workers=1)
-        self.history = _History(len(self.all_processes))
+        self.history = History(len(self.all_processes))
         stream._active = Stream("main", _default=True)
 
     def _run_fake(self, func, args, kwargs):

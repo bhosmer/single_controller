@@ -6,8 +6,8 @@ import torch
 import torch._ops
 from . import messages
 from .reference import Referenceable
-from .history import _Invocation
-from .borrows import _Borrows
+from .history import Invocation
+from .borrows import Borrows
 from .stream import Stream
 from . import stream
 from supervisor import ProcessList
@@ -25,7 +25,7 @@ class Tensor(Referenceable, BaseTensor):
     mesh: 'DeviceMesh'
     ref: Optional[int]
     _borrowed: bool
-    _invocation: Optional[_Invocation]
+    _invocation: Optional[Invocation]
     _fake: torch.Tensor
 
     def __new__(
@@ -80,11 +80,11 @@ class Tensor(Referenceable, BaseTensor):
         assert self.ref is None
 
     @property
-    def _borrows(self) -> _Borrows:
+    def _borrows(self) -> Borrows:
         storage = self._fake.untyped_storage()
         ctrl = self.mesh.ctrl
         if storage not in ctrl.allocation_borrows:
-            ctrl.allocation_borrows[storage] = _Borrows(self.stream)
+            ctrl.allocation_borrows[storage] = Borrows(self.stream)
         return ctrl.allocation_borrows[storage]
 
     @property

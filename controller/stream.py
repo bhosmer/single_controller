@@ -2,7 +2,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional
 from . import messages
 from .reference import Referenceable
-from .borrows import _Borrow
+from .borrows import Borrow
 import traceback
 
 if TYPE_CHECKING:
@@ -74,7 +74,7 @@ class Stream(Referenceable):
         assert r.ref is not None
         t.mesh._send(messages.BorrowCreate(r.ref, t, t.stream, self, already_borrowed))
         if not already_borrowed:
-            borrows.active[self] = _Borrow(r.ref, False, traceback.extract_stack())
+            borrows.active[self] = Borrow(r.ref, False, traceback.extract_stack())
             borrows.writing_stream = self if mutable else None
         return r
 

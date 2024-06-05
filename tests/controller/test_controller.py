@@ -30,7 +30,7 @@ def log(*args):
 def rlist(elem):
     return elem
 
-@remote_function('controller._test_remote_functions.do_bogus_tensor_work')
+@remote_function('controller._testing.do_bogus_tensor_work')
 def do_bogus_tensor_work(x, y, fail_rank=None):
     return x + y  # real function actually does x @ y
 
