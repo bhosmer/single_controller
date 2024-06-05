@@ -55,7 +55,7 @@ def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=No
 __all__ = [
     'RemoteException',
     'remote_function',
-    'Future', 
+    'Future',
     'active_stream',
     'active_mesh',
     'DeviceMesh',

@@ -1,6 +1,10 @@
-from typing import Dict, NamedTuple, Any, Union, Optional, List, Tuple, Callable
+from typing import TYPE_CHECKING, Dict, NamedTuple, Any, Union, Optional, List, Tuple, Callable
 from traceback import FrameSummary
 from .tensor_factory import TensorFactory
+if TYPE_CHECKING:
+    from .stream import Stream
+    from .tensor import Tensor
+    from .device_mesh import DeviceMesh
 
 class CreateDeviceMesh(NamedTuple):
     result: int
@@ -18,7 +22,7 @@ class CallFunction(NamedTuple):
     function: Union[str, Callable]
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
-    stream: Any
+    stream: 'Stream'
 
 class Exit(NamedTuple):
     pass
@@ -36,7 +40,7 @@ class FetchValue(NamedTuple):
     ident: int
     function: Optional[str]
     object: Any
-    stream: Any
+    stream: 'Stream'
 
 class FetchResult(NamedTuple):
     ident: int
@@ -58,9 +62,9 @@ class RequestStatus(NamedTuple):
 
 class BorrowCreate(NamedTuple):
     result: int
-    tensor: Any
-    from_stream: Any
-    to_stream: Any
+    tensor: 'Tensor'
+    from_stream: 'Stream'
+    to_stream: 'Stream'
     alias: bool  # is this an alias of an already existing borrow
 
 class BorrowDrop(NamedTuple):
@@ -73,16 +77,16 @@ class SendTensor(NamedTuple):
     result: int
     from_ranks: List[int]
     to_ranks: List[int]
-    tensor: Any
+    tensor: 'Tensor'
     factory: 'TensorFactory'
-    stream: Any
+    stream: 'Stream'
 
 class Reduce(NamedTuple):
     result: int
-    local_tensor_ref: Any
+    local_tensor_ref: 'Tensor'
     factory: 'TensorFactory'
-    source_mesh_ref: Any
-    stream_ref: Any
+    source_mesh_ref: 'DeviceMesh'
+    stream_ref: 'Stream'
     dim: str
     reduction: str
     scatter: bool

@@ -48,7 +48,6 @@ class DependentOnError(Exception):
         self.ident = ident
 
 class Stream:
-    cuda_stream: Optional[torch.cuda.Stream]
 
     def __init__(self, default: bool):
         if default:
@@ -238,7 +237,7 @@ class Worker:
 
             assert not inplace
             output = torch.empty([source_mesh.dims[dim].size, *local_tensor.shape],
-                                dtype=local_tensor.dtype, device=local_tensor.device, layout=local_tensor.layout)
+                                 dtype=local_tensor.dtype, device=local_tensor.device, layout=local_tensor.layout)
             print(output.shape, local_tensor.shape)
             torch.distributed.all_gather_into_tensor(output, local_tensor, group=group)
             return output
@@ -248,7 +247,7 @@ class Worker:
         if scatter:
             assert not inplace
             output = torch.empty(local_tensor.shape[1:], dtype=local_tensor.dtype,
-                                device=local_tensor.device, layout=local_tensor.layout)
+                                 device=local_tensor.device, layout=local_tensor.layout)
             torch.distributed.reduce_scatter_tensor(output, local_tensor, op=op, group=group)
             return output
 
@@ -299,6 +298,7 @@ class Worker:
                 ops.append(P2POp(isend, tensor, to_rank))
             except ValueError:
                 to_rank = None
+                tensor = None  # silence warnings
 
             try:
                 index = to_ranks.index(self.rank)

@@ -1,5 +1,5 @@
 from supervisor import ProcessList
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import torch
@@ -11,11 +11,14 @@ from . import stream
 from .tensor import dtensor_dispatch
 import itertools
 
+if TYPE_CHECKING:
+    from .controller import Controller
+
 def remote_function(path: str):
     return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active, stream._active, func)
 
 class DeviceMesh(Referenceable):
-    def __init__(self, ctrl: '_Controller', processes: ProcessList, dims):
+    def __init__(self, ctrl: 'Controller', processes: ProcessList, dims):
         self.ctrl = ctrl
         assert len(processes) == math.prod(dims.values())
         self.dims: Dict[str, int] = dims

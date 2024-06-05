@@ -2,12 +2,13 @@ from supervisor import TTL
 from typing import Optional
 
 from .history import RemoteException
+from .controller import Controller
 import logging
 
 logger = logging.getLogger(__name__)
 
 class Future:
-    def __init__(self, ctrl: '_Controller'):
+    def __init__(self, ctrl: 'Controller'):
         self._ctrl = ctrl
         self._status = 'incomplete'
         self._callbacks = None
@@ -29,6 +30,7 @@ class Future:
     def _wait(self, timeout: Optional[float]):
         if self._status != 'incomplete':
             return True
+        assert self._ctrl is not None
         # see if the future is done already
         # and we just haven't processed the messages
         self._ctrl._read_messages(0)

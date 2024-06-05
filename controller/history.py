@@ -1,7 +1,10 @@
-from typing import Any, Sequence, Optional, List
+from typing import TYPE_CHECKING, Any, Sequence, Optional, List
 from collections import deque
 import itertools
 import traceback
+if TYPE_CHECKING:
+    from .tensor import Tensor
+    from .future import Future
 
 class RemoteException(Exception):
     def __init__(self, ident: int, exception: Exception, controller_frames: List[traceback.FrameSummary], worker_frames: List[traceback.FrameSummary]):
@@ -29,13 +32,12 @@ class _Invocation:
         self.failure: Optional[RemoteException] = None
         self.fut: Optional['Future'] = None
         self.fut_value: Any = None
- 
+
     def fail(self, remote_exception: RemoteException):
         if self.failure is None or self.failure.ident > remote_exception.ident:
             self.failure = remote_exception
             return True
         return False
-        
 
 class _History:
     def __init__(self, N):
@@ -44,11 +46,12 @@ class _History:
         self.min_first_uncompleted_ident = 0
         self.invocations = deque[_Invocation]()
         self.last_assigned_ident = -1
-    
+
     def invocation(self, defs: Sequence['Tensor'], uses: Sequence['Tensor']):
         r = _Invocation(traceback.extract_stack()[:-2])
         for t in uses:
             u = t._invocation
+            assert u is not None
             u.users.add(r)
             if u.failure is not None:
                 r.fail(u.failure)
@@ -71,14 +74,14 @@ class _History:
             invocation = worklist.popleft()
             if invocation.fail(remote_exception):
                 worklist.extend(invocation.users)
-    
+
     def rank_completed(self, rank, first_uncompleted_ident):
         # advance what our last completed action was, and
         # trim the list of tracebacks if we no longer need them.
         prev = self.first_uncompleted_ident[rank]
         self.first_uncompleted_ident[rank] = first_uncompleted_ident
         if prev == self.min_first_uncompleted_ident:
-            self.min_first_uncompleted_ident = min(self.first_uncompleted_ident)            
+            self.min_first_uncompleted_ident = min(self.first_uncompleted_ident)
             for _ in range(self.min_first_uncompleted_ident - prev):
                 invocation = self.invocations.popleft()
                 if invocation.fut is not None:

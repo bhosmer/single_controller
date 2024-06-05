@@ -1,17 +1,20 @@
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Optional
 from . import messages
 from .reference import Referenceable
 from .borrows import _Borrow
 import traceback
 
-class Stream(Referenceable):
-    name: str
+if TYPE_CHECKING:
+    from .controller import Controller
+    from .tensor import Tensor
 
+class Stream(Referenceable):
     def __init__(self, name: str, _default=False):
         self.name = name
-        self.default = _default
-        self.ctrl = None
-        self.ref = None
+        self.default: bool = _default
+        self.ctrl: Optional['Controller'] = None
+        self.ref: Optional[int] = None
 
     def __repr__(self):
         return f'<Stream({repr(self.name)}) at {hex(id(self))}>'
@@ -19,7 +22,7 @@ class Stream(Referenceable):
     def __str__(self):
         return f'stream {repr(self.name)}'
 
-    def _use_controller(self, ctrl: '_Controller'):
+    def _use_controller(self, ctrl: 'Controller'):
         if self.ctrl is None:
             self.ctrl = ctrl
         elif self.ctrl is not ctrl:
@@ -63,7 +66,7 @@ class Stream(Referenceable):
         assert self.ctrl is not None
         borrows = t._borrows
         if mutable and borrows.active:
-            raise RuntimeError(f"Cannot borrow this tensor mutably because it (or a view) is already being borrowed non-mutably.")
+            raise RuntimeError("Cannot borrow this tensor mutably because it (or a view) is already being borrowed non-mutably.")
 
         already_borrowed = self in borrows.active
         r = type(t)(t._fake, t.mesh, self, True)

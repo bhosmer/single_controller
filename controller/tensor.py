@@ -1,8 +1,9 @@
-from typing import Dict, Any, Union, Literal, Optional, List, Tuple
+from typing import TYPE_CHECKING, Dict, Any, Union, Literal, Optional, List, Tuple
 from .tree import flatten, tree_map
 from .base_tensor import BaseTensor
 
 import torch
+import torch._ops
 from . import messages
 from .reference import Referenceable
 from .history import _Invocation
@@ -13,6 +14,9 @@ from supervisor import ProcessList
 
 import traceback
 import warnings
+
+if TYPE_CHECKING:
+    from .device_mesh import DeviceMesh
 
 _valid_reduce = Literal['stack', 'sum', 'avg', 'product', 'min', 'max', 'band', 'bor', 'bxor']
 
@@ -55,8 +59,8 @@ class Tensor(Referenceable, BaseTensor):
     def __init__(self, fake: torch.Tensor, mesh: 'DeviceMesh', stream: Stream, borrowed: bool):
         pass
 
-    def __repr__(self):
-       return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={self._fake})"
+    def __repr__(self, *, tensor_contents=None):
+        return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={self._fake})"
 
     def drop(self):
         if self.ref is None:
@@ -189,7 +193,8 @@ class Tensor(Referenceable, BaseTensor):
             borrowtb = ''.join(traceback.format_list(self._borrows.active[self.stream].frames))
             warnings.warn('t.drop() must be called before a borrowed tensor is freed to specify when the borrowed tensor should return to its origin stream, but this tensor is being deleted before drop.'
                           't.drop() is being called automatically here to ensure correctness, but this will force a synchronization back to the original stream at this point which might not be intended.'
-                          f'\nTraceback of __del__(most recent call last):\n{current}\nTraceback of original borrow (most recent call last):{borrowtb}')
+                          f'\nTraceback of __del__(most recent call last):\n{current}\nTraceback of original borrow (most recent call last):{borrowtb}',
+                          stacklevel=2)
             self.drop()
             return
         mesh = self.mesh
@@ -266,7 +271,10 @@ DROPPED
 This tensor, or a view of it, was explicitly deleted with the t.drop() function and is no longer usable.
 """
 
-explain = dict(entry.split('\n', 1) for entry in _explain.split('\n\n'))
+explain = {}
+for entry in _explain.split('\n\n'):
+    k, v = entry.split('\n', 1)
+    explain[k] = v
 
 def dtensor_check(func, args, kwargs, device_mesh, stream) -> Tuple[List['Tensor'], Any]:
     def stringify(t):
