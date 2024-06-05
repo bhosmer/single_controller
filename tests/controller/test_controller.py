@@ -10,7 +10,7 @@ sys.excepthook = custom_excepthook
 from collections import defaultdict
 from supervisor import Context, HostConnected
 from supervisor.host import Host as HostManager
-from controller import world_mesh, active_mesh, _Controller, DeviceMesh, remote_function, Future, RemoteException, fetch_shard, fake_mode, Stream, active_stream
+from controller import world_mesh, active_mesh, _Controller, DeviceMesh, remote_function, Future, RemoteException, fetch_shard, Stream, active_stream
 from contextlib import contextmanager, ExitStack
 from threading import Thread
 from functools import cache, partial
