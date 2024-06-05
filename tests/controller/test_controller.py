@@ -310,8 +310,8 @@ class TestController(TestCase):
             b = s.borrow(x, mutable=True)
             with active_stream(s):
                 b.abs_()
-            # b.drop()
-            del b
+            b.drop()
+            # del b
             x.abs_()
 
     def test_movement(self):

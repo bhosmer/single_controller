@@ -1,31 +1,25 @@
-from supervisor import ProcessList, Context, Host, FunctionCall, TTL
-from typing import Dict, NamedTuple, Any, Sequence, TypedDict, Union, Literal, Optional, List, Tuple
-from torch.utils._python_dispatch import TorchDispatchMode
+from supervisor import Context, Host, FunctionCall, TTL
+from typing import Dict, Sequence, TypedDict, Union, Optional, List
 from concurrent.futures import ThreadPoolExecutor
-from .tree import flatten, tree_map
 from torch._subclasses.fake_tensor import FakeTensorMode
-from .base_tensor import BaseTensor
 
 from typing_extensions import Unpack
 import torch
-from contextlib import contextmanager
-# from .base_tensor import BaseTensor
-import math
 from . import messages
-from .reference import Referenceable
-from .history import _History, RemoteException, _Invocation
-from .borrows import _Borrows, _Borrow
+from .history import _History, RemoteException
+from .borrows import _Borrows
 from .stream import Stream, active_stream
 from .future import Future
-from . import stream
+from .tensor import Tensor, dtensor_check
+from .device_mesh import DeviceMesh, remote_function, active_mesh
+from . import stream, device_mesh
 
 from collections import defaultdict
 import itertools
 import socket
 import logging
 import traceback
-import warnings
-from weakref import WeakKeyDictionary, WeakSet
+from weakref import WeakKeyDictionary
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +108,7 @@ class _Controller:
         return to_delete
 
     def _request_status(self):
-            self.all_processes.send(messages.RequestStatus(self.history.last_assigned_ident))
+        self.all_processes.send(messages.RequestStatus(self.history.last_assigned_ident))
 
     def _read_messages(self, timeout: Optional[float]):
         # XXX - how can we avoid always requesting status when waiting on futures?
@@ -150,9 +144,6 @@ class _Controller:
     def Status(self, proc, first_uncompleted_ident):
         self.history.rank_completed(proc.rank, first_uncompleted_ident)
  
-def remote_function(path: str):
-    return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active_mesh, stream._active, func)
-
 def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: Optional[str] = None):
     """
     Retrieve the shard at `coordinates` of the current device mesh of each tensor in obj.
@@ -162,139 +153,14 @@ def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: O
         preprocess - an optional specifier for a remote function that is applyied to obj before returning the value.
                      This can be used to turn the tensor into some non-tensor values before copying it back
     """
-    tensors, _ = dtensor_check('fetch_shard', (obj,), {}, _active_mesh, stream._active)
-    fut = Future(_active_mesh.ctrl)
-    ident = _active_mesh.ctrl.history.ident((), tensors, fut)
-    process = _active_mesh._process(coordinates)
+    if device_mesh._active is None:
+        raise RuntimeError("No device mesh active")
+    tensors, _ = dtensor_check('fetch_shard', (obj,), {}, device_mesh._active, stream._active)
+    fut = Future(device_mesh._active.ctrl)
+    ident = device_mesh._active.ctrl.history.ident((), tensors, fut)
+    process = device_mesh._active._process(coordinates)
     process.send(messages.FetchValue(ident, preprocess, obj, stream._active))
     return fut
-
-
-
-PyTree = Union[Dict[str, 'PyTree'], List['PyTree'], Tuple['PyTree',...], 'Tensor']
-
-class DeviceMesh(Referenceable):
-    def __init__(self, ctrl: _Controller, processes: ProcessList, dims):
-        self.ctrl = ctrl
-        assert len(processes) == math.prod(dims.values())
-        self.dims: Dict[str, int] = dims
-        self.processes = processes
-        self.ref = None
-
-    def __repr__(self):
-        return f'<DeviceMesh({tuple(self.dims.keys())}, {tuple(self.dims.values())}) at {hex(id(self))}>'
-
-    def define_ref(self):
-        # Optimize: we do not have to send device meshes to all workers if we can
-        # Create process groups as subsets
-        msg = messages.CreateDeviceMesh(self.ctrl.ref(), self.dims, [p.rank for p in self.processes])
-        self.processes.send(msg)
-
-        return msg.result
-
-    def delete_ref(self, ref: int):
-        if not self.ctrl._shutdown:
-            self._send(messages.DeleteRefs([ref]))
-
-    def _send(self, cmd: NamedTuple):
-        to_delete = self.ctrl._flush_deletes(self)
-        if to_delete:
-            self.processes.send(messages.CommandGroup([to_delete, cmd]))
-        else:
-            self.processes.send(cmd)
-
-    def stack(self, **kwargs):
-        raise NotImplementedError()
-
-    def __call__(self, **kwargs) -> 'DeviceMesh':
-        """
-        m.index(batch=3) or m.index(batch=slice(3, None))
-        """
-        ranges = []
-        stride = 1
-        offset = 0
-        dims = {}
-        sizes = list(self.dims.values())
-        for i, (k, v) in enumerate(self.dims.items()):
-            stride = math.prod(sizes[i+1:])
-            if k in kwargs:
-                e = kwargs.pop(k)
-                if isinstance(e, slice):
-                    the_range = range(*e.indices(v))
-                    dims[k] = len(the_range)
-                    ranges.append(stride*x for x in the_range)
-                else:
-                    if e >= v or e < 0:
-                        raise IndexError('index out of range')
-                    offset += e*stride
-            else:
-                dims[k] = v
-                ranges.append(range(0, v*stride, stride))
-        if kwargs:
-            raise TypeError(f'{self} does not have dimension(s) named {tuple(kwargs.keys())}')
-
-        indices = [offset + sum(x) for x in itertools.product(*ranges)]
-        processes = ProcessList(self.processes[x] for x in indices)
-        return DeviceMesh(self.ctrl, processes, dims)
-
-    def split(self, **kwargs: Dict[str, Tuple[str, ...]]):
-        raise NotImplementedError()
-
-    def rotate(self, **kwargs: Dict[str, int]):
-        raise NotImplementedError()
-
-    @remote_function('controller.worker._rank')
-    def rank(self, dim: str):
-        if dim not in self.dims:
-            raise KeyError(f'{self} does not have dimension {repr(dim)}')
-        return torch.full((), 0, dtype=torch.long)
-
-    def _process(self, coordinates: Optional[Dict[str, int]]):
-        if coordinates is None:
-            return self.processes[0]
-        stride = 1
-        offset = 0
-        extra = set(coordinates.keys()) - set(self.dims.keys())
-        if extra:
-            raise KeyError(f'{list(extra)}')
-        for dim, size in reversed(self.dims.items()):
-            idx = coordinates[dim]
-            if idx < 0:
-                idx += size
-            if idx < 0 or idx >= size:
-                raise IndexError(f'{dim} of size {size} has index {idx} out of range')
-            offset += stride*idx
-            stride *= size
-        return self.processes[offset]
-
-    def _use(self, tensor):
-        borrows = tensor._borrows
-        if tensor.stream is not borrows.origin_stream:
-            borrow = borrows.active[tensor.stream]
-            if not borrow.used:
-                self._send(messages.BorrowFirstUse(borrow.id))
-                borrows.active[tensor.stream] = borrow._replace(used=True)
-
-
-def _fake_reduce(tensor, source_mesh, dim, reduction, scatter):
-    if scatter:
-        N = source_mesh.dims[dim]
-        if tensor.ndim == 0 or tensor.size(0) != N:
-            raise TypeError(f'When scattering results the outer most dimension of tensor ({list(tensor.size())} must match the size ({N}) of the dimension "{dim}" being reduced')
-        if reduction == 'stack':
-            # scatter removes a dimension of mesh size
-            # but gather adds the dimension back
-            return tensor
-        return tensor.sum(dim=0)
-    else:
-        if reduction == 'stack':
-            return torch.empty([source_mesh.dims[dim], *tensor.shape],
-                               dtype=tensor.dtype, device=tensor.device, layout=tensor.layout)
-        return tensor.add(tensor)
-
-def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
-    ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
-    return DeviceMesh(ctrl, ctrl.all_processes, {'host': len(ctrl.all_processes) // gpu_per_host, 'gpu': gpu_per_host})
 
 
 class TensorOptions(TypedDict, total=False):
@@ -313,356 +179,6 @@ class Pipe:
     def pop(self, sizes: Sequence[int], **kwargs: Unpack[TensorOptions]) -> 'Tensor':
         raise NotImplementedError()
 
-_valid_reduce = ['stack', 'sum', 'avg', 'product', 'min', 'max', 'band', 'bor', 'bxor']
-
-class Tensor(Referenceable, BaseTensor):
-    stream: Stream
-    mesh: DeviceMesh
-    ref: Optional[int]
-    _borrowed: bool
-    _invocation: Optional[_Invocation]
-    _fake: torch.Tensor
-
-    def __new__(
-        cls,
-        fake: torch.Tensor, mesh: DeviceMesh, stream: Stream, borrowed: bool
-    ):
-        r = torch.Tensor._make_wrapper_subclass(
-            cls,
-            fake.size(),
-            strides=fake.stride(),
-            storage_offset=fake.storage_offset(),
-            device=fake.device,  # This is the device of of either input tensor or first tensor of a list
-            dtype=fake.dtype,
-            layout=fake.layout,
-            requires_grad=fake.requires_grad,
-        )
-        r._fake = fake
-        ctrl = mesh.ctrl
-        r.ref = ctrl.ref()
-        r.mesh = mesh
-        r.stream = stream
-        r._borrowed = borrowed
-        r._borrows.aliases.add(r)
-        r._invocation = None
-        return r
-
-    @classmethod
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        if isinstance(func, torch._ops.OpOverload):
-            function = "torch.ops."  + str(func)
-        else:
-            function = func
-
-        return dtensor_dispatch(function, args, kwargs, _active_mesh, stream._active, func)
-
-    def __init__(self, fake: torch.Tensor, mesh: DeviceMesh, stream: Stream, borrowed: bool):
-        pass
-
-    def __repr__(self):
-       return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={self._fake})"
-
-    def drop(self):
-        if self.ref is None:
-            return
-        borrows = self._borrows
-        for alias in borrows.aliases:
-            if alias.stream is not self.stream:
-                continue
-            alias._drop_ref()
-        if borrows.origin_stream is not self.stream:
-            borrow = borrows.active.pop(self.stream)
-            self.mesh._send(messages.BorrowDrop(borrow.id))
-            if not borrows.active:
-                borrows.writing_stream = borrows.origin_stream
-
-        # we should be in the tensors list as well
-        assert self.ref is None
-
-    @property
-    def _borrows(self) -> _Borrows:
-        storage = self._fake.untyped_storage()
-        ctrl = self.mesh.ctrl
-        if storage not in ctrl.allocation_borrows:
-            ctrl.allocation_borrows[storage] = _Borrows(self.stream)
-        return ctrl.allocation_borrows[storage]
-
-    @property
-    def dropped(self):
-        return self.ref is None
-
-    def _drop_ref(self):
-        assert self.ref is not None
-        # silence borrowing warning
-        self._borrowed = False
-        self.delete_ref(self.ref)
-        self.ref = None
-
-
-    def to_mesh(self, mesh: DeviceMesh):
-        """
-        Move data between one device mesh and another. Sizes of named dimensions must match.
-        If mesh has dimensions that self.mesh does not, it will broadcast to those dimensions.
-
-
-        broadcast:
-            t.slice_mesh(batch=0).to_mesh(t.mesh)
-
-        """
-        return MeshSliceTensor(self, self.mesh).to_mesh(mesh)
-
-    def reduce_(self, dim: str, reduction: Literal["gather", "sum", "max"] = "sum", scatter=False, mesh=None):
-        # TODO: checks that this can actually happen in place e.g. if scatter is True, operation must be gather.
-        inplace_valid = (reduction == 'gather' and scatter) or not scatter
-        if not inplace_valid:
-            raise ValueError(f'reduction {reduction} is not valid for in-place operation because the output size will not match the input size')
-        return self.reduce(dim, reduction, scatter, mesh, _inplace=True)
-
-    def reduce(self, dim: str, reduction: Literal["gather", "sum", "max"] = "sum", scatter=False, mesh=None, _inplace=False):
-        """
-        Perform a reduction operation along dim, and move the data to mesh. If mesh=None, then mesh=self.mesh
-        'gather' will concat the values along dim, and produce a local result tensor with an addition outer dimension of len(dim).
-        If scatter=True, the local result tensor will be evenly split across dim.
-
-        allreduce:
-            t.reduce('batch', 'sum')
-
-            First reduces dim 'batch' creating a local tensor with the 'batch' dimension, then because output_mesh=input_mesh, and it still has dim 'batch',
-            we broadcast the result reduced tensor to all members of batch.
-
-        reducescatter:
-            t.reduce('batch', 'sum', scatter=True)
-
-            Same as above except that scatter=True introduces a new 'batch' dimension that is the result of splitting the local tensor across 'batch'
-
-        allgather:
-            t.reduce('batch', 'gather')
-
-            First reduces dim 'batch' creating a bigger local tensor, then because output_mesh=input_mesh, and it still has dim 'batch',
-            broadcasts the result concatenated tensor to all members of batch.
-
-        alltoall:
-            t.reduce('batch', 'gather', scatter=True)
-
-
-            First reduces dim 'batch' creating a bigger local tensor, then introduces a new 'batch' dimension that is the result of splitting this
-            (bigger) tensor across 'batch'. The result is the same dimension as the original tensor, but with each rank sending to all other ranks.
-
-
-        gather (to dim 0):
-            t.reduce('batch', 'gather', mesh=t.mesh.index(batch=0))
-
-            First gathers dim 'batch' and then places it on the first rank. t.mesh.batch[0] doesn't have a 'batch' dimension, but this is
-            ok because we eliminated the 'batch' dim via reduction.
-
-        reduce:
-            t.reduce('batch', 'sum', mesh=t.mesh.index(batch=0))
-
-            First reduces dim 'batch' and then places it on the first rank. t.mesh.batch[0] doesn't have a 'batch' dimension, but this is
-            ok because we eliminated the 'batch' dim via reduction.
-        """
-        if mesh is not None:
-            raise NotImplementedError()
-        if dim not in self.mesh.dims:
-            raise KeyError(f'dim {dim} not found in {self.mesh}')
-        if reduction not in _valid_reduce:
-            raise ValueError(f'reduction {reduction} not supported, reductions are {_valid_reduce}')
-        if mesh is None:
-            mesh = self.mesh
-
-        if _inplace:
-            fake_output = self._fake
-        else:
-            fake_output = self.mesh.ctrl._run_fake(_fake_reduce, (self._fake, self.mesh, dim, reduction, scatter), {})
-        r = Tensor(fake_output, self.mesh, self.stream, borrowed=False)
-        self.mesh._send(messages.Reduce(r.ref, self, self._factory(), self.mesh, self.stream, dim, reduction, scatter, _inplace))
-        self.mesh.ctrl.history.invocation((r,), (self,))
-        return r
-
-    def slice_mesh(self, **kwargs: Dict[str, Union[int, slice]]) -> 'MeshSliceTensor':
-        # technically a slice of a device mesh and a device mesh are not same thing
-        # because a device mesh also has caches for doing collectives.
-        # but this is an easy way to create a MeshSliceTensor until we optimize
-        # how we represent mesh slices.
-        slicing = self.mesh(**kwargs)
-        return MeshSliceTensor(self, slicing)
-
-    def delete_ref(self, ref: int):
-        if self._borrowed:
-            current = ''.join(traceback.format_stack())
-            borrowtb = ''.join(traceback.format_list(self._borrows.active[self.stream].frames))
-            warnings.warn('t.drop() must be called before a borrowed tensor is freed to specify when the borrowed tensor should return to its origin stream, but this tensor is being deleted before drop.'
-                          't.drop() is being called automatically here to ensure correctness, but this will force a synchronization back to the original stream at this point which might not be intended.'
-                          f'\nTraceback of __del__(most recent call last):\n{current}\nTraceback of original borrow (most recent call last):{borrowtb}')
-            self.drop()
-            return
-        mesh = self.mesh
-        mesh.ctrl.pending_del[mesh].append(ref)
-    
-    def _factory(self):
-        return messages.TensorFactory.from_tensor(self._fake)
-
-
-class MeshSliceTensor:
-    def __init__(self, tensor: 'Tensor', slicing: 'DeviceMesh'):
-        self.tensor = tensor
-        self.slicing = slicing
-
-    def to_mesh(self, mesh: 'DeviceMesh') -> 'Tensor':
-        if self.slicing.dims != mesh.dims:
-            raise ValueError(f'input of dimensions {self.slicing.dims} does not match destination mesh of dimensions {mesh.dims}')
-
-        # XXX - this is a very ineffiecient algorithm for figuring out which groups need messages. With O(Workers)
-        # individual sends. The message size is also O(Workers).
-        # An O(Workers) algorithm can easily send O(1) individual messages
-        # but this is suppose to be a stub for an optimized algorithm where:
-        # 1. We can represent submeshes as NDSlice(offet, sizes, strides) on rank.
-        # 2. A message can be efficiently broadcast to List[NDSlice] ranks by a smart tree based algorithm that can
-        #    figure out which subtrees need the message.
-        # 3. The message itself will use List[NDSlice] objects to express the send/recv set and so it is very small
-
-        # so basically both the way the messsage is broadcast and its size will be compressed but the
-        # send pattern and the meaning of the message will be the same as this ineffiecient form
-
-        combined_processes = self.slicing.processes
-        if self.slicing.processes is not mesh.processes:
-            combined_processes = ProcessList(sorted(set(self.slicing.processes).union(mesh.processes), key=lambda p: p.rank))
-
-        from_ranks = [p.rank for p in self.slicing.processes]
-        to_ranks = [p.rank for p in mesh.processes]
-        r = Tensor(self.tensor._fake, mesh, stream._active, False)
-        combined_processes.send(messages.SendTensor(r.ref, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
-        self.tensor.mesh.ctrl.history.invocation((r,), (self.tensor,))
-        return r
-
-
-_explain = """\
-LOCAL_TENSOR
-A local (non-distributed) tensor is being passed while a device_mesh is active.
-If you want to do local tensor compute use `with active_mesh(None):`
-
-WRONG_MESH
-A tensor being passed is on a device mesh that is not the current device_mesh.
-Use `with active_mesh(m):` to switch the active mesh, or move the tensor to the correct device mesh with `to_mesh`/`on_mesh`.
-
-WRONG_STREAM
-A tensor being passed is on a stream that is not the current active stream. Use with `active_stream(s)` to switch streams, or
-move the tensor to the correct stream with `.borrow`.
-
-DROPPED
-This tensor, or a view of it, was explicitly deleted with the t.drop() function and is no longer usable.
-"""
-
-explain = dict(entry.split('\n', 1) for entry in _explain.split('\n\n'))
-
-
-def dtensor_check(func, args, kwargs, device_mesh, stream) -> Tuple[List['Tensor'], Any]:
-    def stringify(t):
-        if isinstance(t, Tensor):
-            if t.mesh is not device_mesh:
-                return 'WRONG_MESH'
-            elif t.stream is not stream:
-                return 'WRONG_STREAM'
-            elif t.dropped:
-                return 'DROPPED'
-            else:
-                return '.'
-        elif isinstance(t, torch.Tensor):
-            return 'LOCAL_TENSOR'
-        else:
-            return t
-
-    def tensor_check(x):
-        if isinstance(x, torch.Tensor):
-            if isinstance(x, Tensor) and x.mesh is device_mesh and x.stream is stream and not x.dropped:
-                device_mesh._use(x)
-                return True
-            fargs, fkwargs = tree_map(stringify, (args, kwargs))
-            actuals = ', '.join(str(a) for a in fargs)
-            if fkwargs:
-                actuals = f'{actuals}, ' + ', '.join(f'{k}={v}' for k, v in kwargs.items())
-
-            call = f"{func}({actuals})"
-            dmesh = f'active_mesh = {device_mesh}\nactive_stream = {stream}'
-            help = '\n'.join(f'{k}: {v}' for k, v in explain.items() if k in call)
-            raise TypeError(f'Mismatched arguments to distributed tensor operation:\n\n  {call}\n\n{dmesh}\n{help}')
-
-    dtensors, unflatten = flatten((args, kwargs), tensor_check)
-    return dtensors, unflatten
-
-def dtensor_dispatch(func, args, kwargs, device_mesh: Optional[DeviceMesh], stream: Stream, result_type):
-    dtensors, unflatten = dtensor_check(func, args, kwargs, device_mesh, stream)
-    assert device_mesh is not None
-    ctrl = device_mesh.ctrl
-    stream._use_controller(ctrl)
-
-    mutates = []
-    if callable(result_type):
-        fake_input_tensors = [d._fake for d in dtensors]
-        before_versions = [f._version for f in fake_input_tensors]
-        fake_args, fake_kwargs = unflatten(fake_input_tensors)
-        result = ctrl._run_fake(result_type, fake_args, fake_kwargs)
-        for i in range(len(dtensors)):
-            if before_versions[i] < fake_input_tensors[i]._version:
-                borrows = dtensors[i]._borrows
-                writing_stream = borrows.writing_stream
-                if writing_stream is not stream:
-                    reason = "it is read only because it is being borrowed" if writing_stream is None \
-                             else f"it can only be mutated by f{writing_stream}"
-                    tbs = ''.join(f"Traceback of borrow to {k} (most recent frame last):\n{''.join(traceback.format_list(b.frames))}" for k,b in borrows.active.items())
-                    raise ValueError(f"\n{tbs}\nTensor input {i} would be mutated by this operator but {reason}")
-                mutates.extend(dtensors[i]._borrows.aliases)
-        fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
-    else:
-        result = result_type
-        fake_map = {}
-
-    fake_result_dtensors, unflatten_result = flatten(result, lambda x: isinstance(x, torch.Tensor))
-
-    # sometimes operators return references to inputs, in which case the result should be the same DTensor object
-    # otherwise we create a new DTensor with a new RemoteRef for the result
-    result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream, False) for fake in fake_result_dtensors)
-    ident = device_mesh.ctrl.history.ident(result_dtensors + tuple(mutates), dtensors)
-    device_mesh._send(messages.CallFunction(ident, tuple(r.ref for r in result_dtensors), tuple(r.ref for r in mutates), func, args, kwargs, stream))    
-    results = unflatten_result(result_dtensors)
-    # XXX - realistically this would be done on a non-python thread, keeping our messages up to date
-    # but we can approximate it by checking for all ready meassages whenever we schedule new work
-    device_mesh.ctrl._read_messages(0)
-    return results
-
-
-_active_mesh: Optional[DeviceMesh] = None
-_dispatch_enabled = False
-
-
-class _ActiveMesh(TorchDispatchMode):
-    ignore = ['profiler._record_function_exit._RecordFunction']
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if _active_mesh is None:
-            return func(*args, **kwargs)
-        return Tensor.__torch_dispatch__(func, types, args, kwargs)
-
-
-@contextmanager
-def _dispatch():
-    global _dispatch_enabled
-    if _dispatch_enabled:
-        yield
-    else:
-        _dispatch_enabled = True
-        try:
-            with _ActiveMesh():
-                yield
-        finally:
-            _dispatch_enabled = False
-
-@contextmanager
-def active_mesh(mesh: Optional[DeviceMesh]):
-    global _active_mesh
-    _active_mesh, old = mesh, _active_mesh
-    try:
-        with _dispatch():
-            yield
-    finally:
-        _active_mesh = old
+def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
+    ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
+    return DeviceMesh(ctrl, ctrl.all_processes, {'host': len(ctrl.all_processes) // gpu_per_host, 'gpu': gpu_per_host})

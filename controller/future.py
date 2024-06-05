@@ -50,7 +50,7 @@ class Future:
                     return self._status != 'incomplete'
         return True
 
-    def result(self, timeout: Optional[float]=None):
+    def result(self, timeout: Optional[float] = None):
         if not self._wait(timeout):
             raise TimeoutError()
         assert self._result is not None
@@ -61,7 +61,7 @@ class Future:
     def done(self) -> bool:
         return self._wait(0)
 
-    def exception(self, timeout: Optional[float]=None):
+    def exception(self, timeout: Optional[float] = None):
         if not self._wait(timeout):
             raise TimeoutError()
         return self._result if self._status == 'exception' else None
