@@ -11,6 +11,7 @@ from collections import defaultdict
 from supervisor import Context, HostConnected
 from supervisor.host import Host as HostManager
 from controller import world_mesh, active_mesh, _Controller, DeviceMesh, remote_function, Future, RemoteException, fetch_shard, Stream, active_stream
+from controller.ndslice import NDSlice
 from contextlib import contextmanager, ExitStack
 from threading import Thread
 from functools import cache, partial
@@ -22,6 +23,8 @@ import os
 from unittest.mock import patch
 from weakref import WeakKeyDictionary
 from controller._testing import LocalContext
+import random
+import math
 
 @remote_function('controller.worker.log')
 def log(*args):
@@ -284,69 +287,73 @@ class TestController(TestCase):
                 log("y: %s", y)
                 log("c: %s", c)
 
+    def test_ndslice(self):
+        def check(s):
+            elems = list(s)
+            # print("checking", s, elems)
+            all = set(elems)
+            assert len(all) == len(elems), "wrong checks for valid strides"
+            if all:
+                small = min(all)
+                large = max(all)
 
-    def test_simple_examples(self):
-        # `local_device_mesh` is just a helper for testing
-        # that sets up the worker processes/host managers/etc.
-        # locally. For 'real' programs the initial device_mesh
-        # will be provided at program start.
-        with self.local_device_mesh(2, 2, activate=False) as device_mesh:
+            for i, e in enumerate(s):
+                assert s[i] == e, "index broken"
+                # print(i, ":", e, s.index(e))
+                assert s.index(e) == i, "inverse broken"
 
-            print(device_mesh)
-            # <DeviceMesh(('host', 'gpu'), (2, 2)) at 0x7fa6175b3bb0>
-            h0 = device_mesh(host=0)
-            h1 = device_mesh(host=1)
+            N = math.prod(s.sizes)
+            try:
+                s[N]
+                raise RuntimeError("index broken, too many elements")
+            except IndexError:
+                pass
 
+            try:
+                s[-1]
+                raise RuntimeError("index broken, too many elements")
+            except IndexError:
+                pass
 
-            # Device Meshes are multi-dimension lists with named
-            # dimensions. On startup they will initially have a host and gpu dimension.
+            if not all:
+                return
+            for i in range(small, large + 1):
+                try:
+                    if i not in s:
+                        s.index(i)
+                        raise RuntimeError("index broken, extra elements")
+                except ValueError:
+                    pass
 
+        check(NDSlice(0, [3, 4], [4, 1]))
+        check(NDSlice(0, [3, 4], [1, 4]))
+        check(NDSlice(1, [3], [2]))
+        check(NDSlice(1, [3, 3], [12, 2]))
+        check(NDSlice(0, [4, 3, 8], [48, 16, 2]))
+        check(NDSlice(24, [4, 3, 8], [48*2, 16, 2]))
+        check(NDSlice(37, [], []))
 
-            # When there is no active device mesh, compute is local
-            t = torch.rand(1)
-            print(t)
-            # tensor([0.6893])
+        def fuzz(gen):
+            ndim = gen.choices([1, 2, 3, 4], [1, 2, 3, 4])[0]
+            sizes = [gen.randrange(1, 10) for _ in range(ndim)]
+            strides = []
+            run = 1
+            for j in range(ndim):
+                run *= gen.randrange(1 if j == 0 else 2, 4)
+                strides.append(run)
 
-            # now _all_ compute is done on the device mesh within this context
-            with active_mesh(device_mesh):
-                x = torch.rand(3, 4)
-                y = x + x
-                print(y)
-                # DTensor(mesh=..., stream=<Stream('main') at 0x7f79451b3c10>, fake=FakeTensor(..., size=(3, 4)))
-                with self.assertRaisesRegex(TypeError, 'LOCAL_TENSOR'):
-                    z = y.add(t)
-                    """
-                    TypeError: Mismatched arguments to distributed tensor operation:
+            order = list(range(ndim))
+            gen.shuffle(order)
+            try:
+                return NDSlice(gen.randrange(10000), [sizes[o] for o in order], [strides[o] for o in order])
+            except ValueError:
+                # rejection sample, because some things are not in bound
+                return fuzz(gen)
 
-                    torch.ops.aten.add.Tensor(., LOCAL_TENSOR)
-
-                    active_mesh = <DeviceMesh(('host', 'gpu'), (2, 2)) at 0x7f1a468bbe20>
-                    active_stream = <Stream('main') at 0x7f1a468bbd30>
-                    LOCAL_TENSOR: A local (non-distributed) tensor is being passed while a device_mesh is active.
-                    If you want to do local tensor compute use `with active_mesh(None):`
-                    """
-                # we can use helper functions to get the worker machines to log tensor info they have
-                log("Y: %s", y)
-                # worker_0: Y: tensor([[0.7125, 0.9058, 0.8245, 0.7008],
-                # worker_0:         [1.3899, 0.9606, 0.4697, 1.9011],
-                # worker_0:         [1.7506, 1.9513, 0.5936, 1.2739]])
-                # worker_3: Y: tensor([[1.1647, 1.8845, 1.7686, 0.2304],
-                # worker_3:         [0.4569, 0.9294, 0.0358, 0.8630],
-                # worker_3:         [1.3946, 1.3274, 1.1046, 0.3136]])
-
-                # log isn't special, it is just a remote function call.
-                #  Note how we use strings to name functions on the controller.
-                #  This is so the controller doesn't have to load modules
-                #  That might only be installed on the workers, or cannot work
-                #  without initializing a cuda context.
-                #     log = RemoteFunction('controller.worker.log')
-
-                # If you have a remote function that returns tensors, then you can
-                # specify a type propagation function when creating it.
-
-                #
-
-
+        gen = random.Random(0)
+        for _ in range(1000):
+            s = fuzz(gen)
+            check(s)
 
 
 

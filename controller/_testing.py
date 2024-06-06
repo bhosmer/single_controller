@@ -3,7 +3,7 @@ from contextlib import ExitStack, contextmanager
 from weakref import WeakKeyDictionary
 from supervisor import Context, HostConnected
 from supervisor.host import Host as HostManager
-from functools import partial, cache
+from functools import partial
 from threading import Thread
 from controller.controller import Controller
 from controller import world_mesh, active_mesh
