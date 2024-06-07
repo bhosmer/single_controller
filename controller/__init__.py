@@ -23,11 +23,13 @@ def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: O
     """
     if device_mesh._active is None:
         raise RuntimeError("No device mesh active")
-    tensors, _ = dtensor_check('fetch_shard', (obj,), {}, device_mesh._active, stream._active)
-    fut = Future(device_mesh._active.ctrl)
-    ident = device_mesh._active.ctrl.history.ident((), tensors, fut)
-    process = device_mesh._active._process(coordinates)
-    process.send(messages.FetchValue(ident, preprocess, obj, stream._active))
+    mesh = device_mesh._active
+    ctrl = mesh.ctrl
+    tensors, _ = dtensor_check('fetch_shard', (obj,), {}, mesh, stream._active)
+    fut = Future(ctrl)
+    ident = ctrl.history.ident((), tensors, fut)
+    process = mesh._process(coordinates)
+    ctrl.send([process], messages.FetchValue(ident, preprocess, obj, stream._active))
     return fut
 
 
@@ -49,7 +51,7 @@ class Pipe:
 
 def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
     ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
-    return DeviceMesh(ctrl, ctrl.all_processes, {'host': len(ctrl.all_processes) // gpu_per_host, 'gpu': gpu_per_host})
+    return DeviceMesh(ctrl, list(ctrl.all_ranks), {'host': len(ctrl.all_processes) // gpu_per_host, 'gpu': gpu_per_host})
 
 def get_active_stream():
     return stream._active

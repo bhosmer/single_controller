@@ -76,7 +76,7 @@ class TestController(TestCase):
                     x.add(y)
 
     def test_mesh_index(self):
-        fake_processes = tuple(range(0, 2*3*4))
+        fake_processes = list(range(0, 2*3*4))
         dm = DeviceMesh(None, fake_processes, {'a': 2, 'b': 3, 'c': 4})
         self.assertEqual(0, dm(a=0, b=0, c=0).processes[0])
         x = dm(a=0, b=0)
@@ -85,7 +85,7 @@ class TestController(TestCase):
         x = dm(c=slice(None, None, 2))
         self.assertEqual(x.processes, fake_processes[::2])
         x = dm(b=2, c=3)
-        self.assertEqual(x.processes, (11, 23))
+        self.assertEqual(x.processes, [11, 23])
 
     def test_sub_mesh(self):
         with self.local_device_mesh(2, 2) as device_mesh:

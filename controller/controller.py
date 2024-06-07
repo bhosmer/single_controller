@@ -1,5 +1,5 @@
 from supervisor import Context, Host, FunctionCall, TTL
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Sequence, NamedTuple
 from concurrent.futures import ThreadPoolExecutor
 from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -82,9 +82,17 @@ class Controller:
                                              'STORE_HOSTNAME': store.host,
                                              'STORE_PORT': str(store.port), })
 
+    def send(self, ranks: Sequence[int], msg: NamedTuple):
+        for rank in ranks:
+            self.all_processes[rank].send(msg)
+
+    @property
+    def all_ranks(self):
+        return range(len(self.all_processes))
+
     def shutdown(self):
         self._shutdown = True
-        self.all_processes.send(messages.Exit())
+        self.send(self.all_ranks, messages.Exit())
         while len(self.exited) < len(self.all_processes):
             self.handle_message(self.ctx.recv())
 
@@ -103,7 +111,7 @@ class Controller:
         return to_delete
 
     def _request_status(self):
-        self.all_processes.send(messages.RequestStatus(self.history.last_assigned_ident))
+        self.send(self.all_ranks, messages.RequestStatus(self.history.last_assigned_ident))
 
     def _read_messages(self, timeout: Optional[float]):
         # XXX - how can we avoid always requesting status when waiting on futures?

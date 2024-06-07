@@ -33,12 +33,12 @@ class Stream(Referenceable):
         # no need to buffer the delets
         assert self.ctrl is not None
         if not self.ctrl._shutdown:
-            self.ctrl.all_processes.send(messages.DeleteRefs([ref]))
+            self.ctrl.send(self.ctrl.all_ranks, messages.DeleteRefs([ref]))
 
     def define_ref(self):
         assert self.ctrl is not None
         r = self.ctrl.ref()
-        self.ctrl.all_processes.send(messages.CreateStream(r, self.default))
+        self.ctrl.send(self.ctrl.all_ranks, messages.CreateStream(r, self.default))
         return r
 
     @contextmanager

@@ -1,5 +1,5 @@
 from supervisor import ProcessList
-from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple, List
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import torch
@@ -18,8 +18,9 @@ def remote_function(path: str):
     return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active, stream._active, func)
 
 class DeviceMesh(Referenceable):
-    def __init__(self, ctrl: 'Controller', processes: ProcessList, dims):
+    def __init__(self, ctrl: 'Controller', processes: List[int], dims):
         self.ctrl = ctrl
+        assert isinstance(processes, list)
         assert len(processes) == math.prod(dims.values())
         self.dims: Dict[str, int] = dims
         self.processes = processes
@@ -31,21 +32,21 @@ class DeviceMesh(Referenceable):
     def define_ref(self):
         # Optimize: we do not have to send device meshes to all workers if we can
         # Create process groups as subsets
-        msg = messages.CreateDeviceMesh(self.ctrl.ref(), self.dims, [p.rank for p in self.processes])
-        self.processes.send(msg)
-
+        msg = messages.CreateDeviceMesh(self.ctrl.ref(), self.dims, self.processes)
+        self._send(msg, flush_deletes=False)
         return msg.result
 
     def delete_ref(self, ref: int):
         if not self.ctrl._shutdown:
             self._send(messages.DeleteRefs([ref]))
 
-    def _send(self, cmd: NamedTuple):
-        to_delete = self.ctrl._flush_deletes(self)
-        if to_delete:
-            self.processes.send(messages.CommandGroup([to_delete, cmd]))
-        else:
-            self.processes.send(cmd)
+    def _send(self, cmd: NamedTuple, flush_deletes=True):
+        if flush_deletes:
+            to_delete = self.ctrl._flush_deletes(self)
+            if to_delete:
+                self.ctrl.send(self.processes, messages.CommandGroup([to_delete, cmd]))
+                return
+        self.ctrl.send(self.processes, cmd)
 
     def stack(self, **kwargs):
         raise NotImplementedError()
@@ -78,7 +79,7 @@ class DeviceMesh(Referenceable):
             raise TypeError(f'{self} does not have dimension(s) named {tuple(kwargs.keys())}')
 
         indices = [offset + sum(x) for x in itertools.product(*ranges)]
-        processes = ProcessList(self.processes[x] for x in indices)
+        processes = [self.processes[x] for x in indices]
         return DeviceMesh(self.ctrl, processes, dims)
 
     def split(self, **kwargs: Dict[str, Tuple[str, ...]]):
@@ -95,7 +96,7 @@ class DeviceMesh(Referenceable):
 
     def _process(self, coordinates: Optional[Dict[str, int]]):
         if coordinates is None:
-            return self.processes[0]
+            return 0
         stride = 1
         offset = 0
         extra = set(coordinates.keys()) - set(self.dims.keys())
@@ -109,7 +110,7 @@ class DeviceMesh(Referenceable):
                 raise IndexError(f'{dim} of size {size} has index {idx} out of range')
             offset += stride*idx
             stride *= size
-        return self.processes[offset]
+        return offset
 
     def _use(self, tensor):
         borrows = tensor._borrows

@@ -227,13 +227,13 @@ class MeshSliceTensor:
 
         combined_processes = self.slicing.processes
         if self.slicing.processes is not mesh.processes:
-            combined_processes = ProcessList(sorted(set(self.slicing.processes).union(mesh.processes), key=lambda p: p.rank))
+            combined_processes = sorted(set(self.slicing.processes).union(mesh.processes))
 
-        from_ranks = [p.rank for p in self.slicing.processes]
-        to_ranks = [p.rank for p in mesh.processes]
+        from_ranks = self.slicing.processes
+        to_ranks = mesh.processes
         r = Tensor(self.tensor._fake, mesh, stream._active, False)
         assert r.ref is not None
-        combined_processes.send(messages.SendTensor(r.ref, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
+        self.tensor.mesh.ctrl.send(combined_processes, messages.SendTensor(r.ref, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
         self.tensor.mesh.ctrl.history.invocation((r,), (self.tensor,))
         return r
 

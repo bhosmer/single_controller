@@ -172,6 +172,7 @@ class Worker:
             exc = DependentOnError(ident)
             for r in results:
                 self.define(r, exc)
+            logger.exception(f"Error generating {ident}")
             self.q.send(messages.RemoteFunctionFailed(ident, e, extract_tb(e.__traceback__)))
         self.first_uncompleted_ident = ident + 1          
 
