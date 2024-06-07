@@ -93,7 +93,7 @@ class Controller:
                                              'STORE_PORT': str(store.port), })
 
     def send(self, ranks: Sequence[int], msg: NamedTuple):
-        for rank in ranks:
+       for rank in ranks:
             self.all_processes[rank].send(msg)
 
     @property

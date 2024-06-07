@@ -32,9 +32,9 @@ class DeviceMesh(Referenceable):
     def define_ref(self):
         # Optimize: we do not have to send device meshes to all workers if we can
         # Create process groups as subsets
-        msg = messages.CreateDeviceMesh(self.ctrl.ref(), self.dims, self.processes)
+        self.ref = self.ctrl.ref()
+        msg = messages.CreateDeviceMesh(self, self.dims, self.processes)
         self._send(msg, flush_deletes=False)
-        return msg.result
 
     def delete_ref(self, ref: int):
         if not self.ctrl._shutdown:

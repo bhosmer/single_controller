@@ -7,18 +7,18 @@ if TYPE_CHECKING:
     from .device_mesh import DeviceMesh
 
 class CreateDeviceMesh(NamedTuple):
-    result: int
+    result: 'DeviceMesh'
     dims: Dict[str, int]
     ranks: List[int]
 
 class CreateStream(NamedTuple):
-    result: int
+    result: 'Stream'
     default: bool
 
 class CallFunction(NamedTuple):
     ident: int
-    results: Tuple[int, ...]
-    mutates: Tuple[int, ...]
+    results: Tuple['Tensor', ...]
+    mutates: Tuple['Tensor', ...]
     function: Union[str, Callable]
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
@@ -61,7 +61,7 @@ class RequestStatus(NamedTuple):
     ident: int
 
 class BorrowCreate(NamedTuple):
-    result: int
+    result: 'Tensor'
     tensor: 'Tensor'
     from_stream: 'Stream'
     to_stream: 'Stream'
@@ -74,7 +74,7 @@ class BorrowFirstUse(NamedTuple):
     borrow: int
 
 class SendTensor(NamedTuple):
-    result: int
+    result: 'Tensor'
     from_ranks: List[int]
     to_ranks: List[int]
     tensor: 'Tensor'
@@ -82,7 +82,7 @@ class SendTensor(NamedTuple):
     stream: 'Stream'
 
 class Reduce(NamedTuple):
-    result: int
+    result: 'Tensor'
     local_tensor_ref: 'Tensor'
     factory: 'TensorFactory'
     source_mesh_ref: 'DeviceMesh'

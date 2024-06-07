@@ -37,9 +37,8 @@ class Stream(Referenceable):
 
     def define_ref(self):
         assert self.ctrl is not None
-        r = self.ctrl.ref()
-        self.ctrl.send(self.ctrl.all_ranks, messages.CreateStream(r, self.default))
-        return r
+        self.ref = self.ctrl.ref()
+        self.ctrl.send(self.ctrl.all_ranks, messages.CreateStream(self, self.default))
 
     @contextmanager
     def coalesce(self):
@@ -72,7 +71,7 @@ class Stream(Referenceable):
         r = type(t)(t._fake, t.mesh, self, True)
         self.ctrl.history.invocation((r,), (t,))
         assert r.ref is not None
-        t.mesh._send(messages.BorrowCreate(r.ref, t, t.stream, self, already_borrowed))
+        t.mesh._send(messages.BorrowCreate(r, t, t.stream, self, already_borrowed))
         if not already_borrowed:
             borrows.active[self] = Borrow(r.ref, False, traceback.extract_stack())
             borrows.writing_stream = self if mutable else None

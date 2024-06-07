@@ -175,7 +175,7 @@ class Tensor(Referenceable, BaseTensor):
             fake_output = self.mesh.ctrl._run_fake(_fake_reduce, (self._fake, self.mesh, dim, reduction, scatter), {})
         r = Tensor(fake_output, self.mesh, self.stream, borrowed=False)
         assert r.ref is not None
-        self.mesh._send(messages.Reduce(r.ref, self, self._factory(), self.mesh, self.stream, dim, reduction, scatter, _inplace))
+        self.mesh._send(messages.Reduce(r, self, self._factory(), self.mesh, self.stream, dim, reduction, scatter, _inplace))
         self.mesh.ctrl.history.invocation((r,), (self,))
         return r
 
@@ -233,7 +233,7 @@ class MeshSliceTensor:
         to_ranks = mesh.processes
         r = Tensor(self.tensor._fake, mesh, stream._active, False)
         assert r.ref is not None
-        self.tensor.mesh.ctrl.send(combined_processes, messages.SendTensor(r.ref, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
+        self.tensor.mesh.ctrl.send(combined_processes, messages.SendTensor(r, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
         self.tensor.mesh.ctrl.history.invocation((r,), (self.tensor,))
         return r
 
@@ -336,7 +336,8 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional['DeviceMesh'], st
                              else f"it can only be mutated by f{writing_stream}"
                     tbs = ''.join(f"Traceback of borrow to {k} (most recent frame last):\n{''.join(traceback.format_list(b.frames))}" for k,b in borrows.active.items())
                     raise ValueError(f"\n{tbs}\nTensor input {i} would be mutated by this operator but {reason}")
-                mutates.extend(dtensors[i]._borrows.aliases)
+                # we might still have alias to other streams if they have been dropped but not yet __del__'d
+                mutates.extend(alias for alias in dtensors[i]._borrows.aliases if alias.stream is stream)
         fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
     else:
         result = result_type
@@ -348,7 +349,9 @@ def dtensor_dispatch(func, args, kwargs, device_mesh: Optional['DeviceMesh'], st
     # otherwise we create a new DTensor with a new RemoteRef for the result
     result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream, False) for fake in fake_result_dtensors)
     ident = device_mesh.ctrl.history.ident(result_dtensors + tuple(mutates), dtensors)
-    device_mesh._send(messages.CallFunction(ident, tuple(r.ref for r in result_dtensors), tuple(r.ref for r in mutates), func, args, kwargs, stream))    
+    assert all(t.ref is not None for t in result_dtensors)
+    assert all(t.ref is not None for t in mutates)
+    device_mesh._send(messages.CallFunction(ident, result_dtensors, tuple(mutates), func, args, kwargs, stream))    
     results = unflatten_result(result_dtensors)
     # XXX - realistically this would be done on a non-python thread, keeping our messages up to date
     # but we can approximate it by checking for all ready meassages whenever we schedule new work

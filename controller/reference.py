@@ -17,7 +17,8 @@ class Referenceable:
 
     def __reduce_ex__(self, protocol):
         if self.ref is None:
-            self.ref = self.define_ref()
+            self.define_ref()
+            assert self.ref is not None
         return Ref, (self.ref,)
 
     def __del__(self):

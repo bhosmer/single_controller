@@ -117,7 +117,7 @@ class Worker:
             return fn(*event)
         raise RuntimeError(f"unhandled event: {event}")
 
-    def CreateDeviceMesh(self, result: int, dims: Dict[str, int], ranks: List[int]):
+    def CreateDeviceMesh(self, result: 'Ref', dims: Dict[str, int], ranks: List[int]):
         index = ranks.index(self.rank)
         self.define(result, DeviceMesh(dims, ranks, index))
 
@@ -142,7 +142,7 @@ class Worker:
             function = getattr(module, funcname)
         return function
 
-    def CallFunction(self, ident: int, results: Tuple[int], mutates: Tuple[int], function: Union[str, Callable], args: Tuple[Any, ...], kwargs: Dict[str, Any], streamref: Ref):
+    def CallFunction(self, ident: int, results: Tuple[Ref], mutates: Tuple[Ref], function: Union[str, Callable], args: Tuple[Any, ...], kwargs: Dict[str, Any], streamref: Ref):
         with self.try_define(ident, results + mutates):
             stream: Stream = self.lookup(streamref)
             args, kwargs = tree_map(self.lookup, (args, kwargs))
@@ -155,11 +155,11 @@ class Worker:
             for r, t in zip(results, tensors):
                 self.define(r, t)
 
-    def CreateStream(self, result: int, default: bool):
+    def CreateStream(self, result: 'Ref', default: bool):
         self.define(result, Stream(default))
 
     @contextmanager
-    def try_define(self, ident: int, results: Tuple[int, ...]):
+    def try_define(self, ident: int, results: Tuple[Ref, ...]):
         try:
             yield
         except DependentOnError as e:
@@ -174,7 +174,7 @@ class Worker:
                 self.define(r, exc)
             logger.exception(f"Error generating {ident}")
             self.q.send(messages.RemoteFunctionFailed(ident, e, extract_tb(e.__traceback__)))
-        self.first_uncompleted_ident = ident + 1          
+        self.first_uncompleted_ident = ident + 1      
 
     def FetchValue(self, ident: int, function_str: Optional[str], obj: Any, streamref: Ref):
         with self.try_define(ident, ()):
@@ -201,18 +201,18 @@ class Worker:
         for id in refs:
             del self.env[id]
 
-    def BorrowCreate(self, result: int, tensorref: Ref, from_streamref, to_streamref, already_borrowed: bool):
+    def BorrowCreate(self, result: Ref, tensorref: Ref, from_streamref, to_streamref, already_borrowed: bool):
         try:
             from_stream = self.lookup(from_streamref)
             to_stream = self.lookup(to_streamref)
             tensor = self.lookup(tensorref)
             self.define(result, tensor)
             if not already_borrowed:
-                self.borrows[result] = Borrow(from_stream, to_stream)
+                self.borrows[result.id] = Borrow(from_stream, to_stream)
         except DependentOnError as e:
             self.define(result, e)
             if not already_borrowed:
-                self.borrows[result] = None
+                self.borrows[result.id] = None
 
     def BorrowFirstUse(self, borrow: int):
         b = self.borrows[borrow]
@@ -257,13 +257,13 @@ class Worker:
         torch.distributed.all_reduce(output, op=op, group=group)
         return output
 
-    def Reduce(self, result: int, local_tensor_ref: Ref, factory: TensorFactory, source_mesh_ref: Ref, stream_ref: Ref, dim: str, reduction: str, scatter: bool, inplace: bool):
+    def Reduce(self, result: Ref, local_tensor_ref: Ref, factory: TensorFactory, source_mesh_ref: Ref, stream_ref: Ref, dim: str, reduction: str, scatter: bool, inplace: bool):
         source_mesh = self.lookup(source_mesh_ref)
         stream = self.lookup(stream_ref)
         with stream.enable():
             try:
                 local_tensor = self.lookup(local_tensor_ref)
-            except DependentOnError as e:
+            except DependentOnError:
                 # even if we were broken before, we have to participate in the collective
                 # because we cannot signal to other ranks that we were broken
                 # the controller will see the error message we sent before and know
@@ -275,7 +275,7 @@ class Worker:
             output = self._reduce(local_tensor, source_mesh, dim, reduction, scatter, inplace)
             self.define(result, output)
 
-    def SendTensor(self, result: int, from_ranks: List[int], to_ranks: List[int], tensorref: Ref, factory: TensorFactory, streamref):
+    def SendTensor(self, result: Ref, from_ranks: List[int], to_ranks: List[int], tensorref: Ref, factory: TensorFactory, streamref):
         try:
             stream = self.lookup(streamref)
         except DependentOnError as e:
@@ -315,8 +315,9 @@ class Worker:
             for op in torch.distributed.batch_isend_irecv(ops):
                 op.wait()
 
-    def define(self, r: int, value: Any):
-        self.env[r] = value
+    def define(self, r: Ref, value: Any):
+        assert isinstance(r, Ref)
+        self.env[r.id] = value
 
     def _send_status(self):
         if self.first_uncompleted_ident > self.last_send_status:
