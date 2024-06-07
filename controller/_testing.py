@@ -5,7 +5,7 @@ from supervisor import Context, HostConnected
 from supervisor.host import Host as HostManager
 from functools import partial
 from threading import Thread
-from controller.controller import Controller
+from controller.controller import Controller, ProcessBackend
 from controller import world_mesh, active_mesh
 import signal
 from time import sleep
@@ -57,8 +57,8 @@ class LocalContext:
 
         connections = ctx.messagefilter(HostConnected)
         hosts = [connections.recv(timeout=1).sender for _ in range(N)]
-        store = Controller._create_store()
-        processes = Controller._create_pg(ctx, hosts, gpu_per_host, store, _restartable=True)
+        store = ProcessBackend._create_store()
+        processes = ProcessBackend._create_pg(ctx, hosts, gpu_per_host, store, _restartable=True)
         yield ctx, hosts, processes
         for p in processes:
             p.signal(signal.SIGTERM)

@@ -1,4 +1,4 @@
-from supervisor import Context, Host, FunctionCall, TTL
+from supervisor import Context, Host, FunctionCall, TTL, Process
 from typing import Dict, Optional, List, Sequence, NamedTuple, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -18,6 +18,9 @@ import socket
 import traceback
 from weakref import WeakKeyDictionary
 from abc import ABC, abstractmethod
+import logging
+
+logger = logging.getLogger(__name__)
 
 check_correctness_per_operator = False
 if check_correctness_per_operator:
@@ -37,7 +40,7 @@ else:
 
 _CONTROLLER_STATUS_INTERVAL = 2
 
-class Messaging(ABC):
+class Backend(ABC):
     @abstractmethod
     def send(self, ranks: Sequence[int], msg) -> None:
         raise NotImplementedError()
@@ -46,29 +49,47 @@ class Messaging(ABC):
     def recvready(self, timeout: Optional[float]) -> Sequence[Tuple[int, NamedTuple]]:
         raise NotImplementedError()
 
-class Controller:
+    @abstractmethod
+    def recv(self, timeout: Optional[float]) -> Tuple[int, NamedTuple]:
+        raise NotImplementedError()
+
+    @property
+    @abstractmethod
+    def world_size(self):
+        raise NotImplementedError()
+
+
+class ProcessBackend(Backend):
     def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None, _store=None):
         self.ctx = ctx
         self.hosts = hosts
         self.store = self._create_store() if _store is None else _store
         self.all_processes = self._create_pg(ctx, hosts, gpu_per_host, self.store) if _processes is None else _processes
-        self.next_ref = itertools.count()
-        self.exited = {}
-        self.failures: Dict[int, Dict[int, RemoteException]] = defaultdict(dict)
-        self.pending_del: Dict[DeviceMesh, List[int]] = defaultdict(list)
-        self._shutdown = False
-        self.incomplete_futures = {}
-        self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
-        self.allocation_borrows: WeakKeyDictionary[torch.UntypedStorage, Borrows] = WeakKeyDictionary()
-        self.fake_mode_worker = ThreadPoolExecutor(max_workers=1)
-        self.history = History(len(self.all_processes))
-        stream._active = Stream("main", _default=True)
 
-    def _run_fake(self, func, args, kwargs):
-        def work():
-            with fake_mode:
-                return func(*args, **kwargs)
-        return self.fake_mode_worker.submit(work).result()
+    @property
+    def world_size(self):
+        return len(self.all_processes)
+
+    def send(self, ranks: Sequence[int], msg) -> None:
+        for rank in ranks:
+            self.all_processes[rank].send(msg)
+
+    def recvready(self, timeout: Optional[float]) -> Sequence[Tuple[int, NamedTuple]]:
+        result = []
+        for sender, msg in self.ctx.recvready(timeout):
+            if isinstance(sender, Process):
+                result.append((sender.rank, msg))
+            else:
+                logger.warning("TODO: ignoring non-process message: %s %s", sender, msg)
+        return result
+
+    def recv(self, timeout: Optional[float]) -> Tuple[int, NamedTuple]:
+        while True:
+            sender, msg = self.ctx.recv(timeout)
+            if isinstance(sender, Process):
+                return (sender.rank, msg)
+            else:
+                logger.warning("TODO: ignoring non-process message: %s %s", sender, msg)
 
     @staticmethod
     def _create_store():
@@ -92,20 +113,41 @@ class Controller:
                                              'STORE_HOSTNAME': store.host,
                                              'STORE_PORT': str(store.port), })
 
+
+class Controller:
+    def __init__(self, backend: Backend):
+        self.backend = backend
+        self.next_ref = itertools.count()
+        self.exited = {}
+        self.failures: Dict[int, Dict[int, RemoteException]] = defaultdict(dict)
+        self.pending_del: Dict[DeviceMesh, List[int]] = defaultdict(list)
+        self._shutdown = False
+        self.incomplete_futures = {}
+        self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
+        self.allocation_borrows: WeakKeyDictionary[torch.UntypedStorage, Borrows] = WeakKeyDictionary()
+        self.fake_mode_worker = ThreadPoolExecutor(max_workers=1)
+        self.history = History(self.backend.world_size)
+        stream._active = Stream("main", _default=True)
+
+    def _run_fake(self, func, args, kwargs):
+        def work():
+            with fake_mode:
+                return func(*args, **kwargs)
+        return self.fake_mode_worker.submit(work).result()
+
     def send(self, ranks: Sequence[int], msg: NamedTuple):
-       for rank in ranks:
-            self.all_processes[rank].send(msg)
+        self.backend.send(ranks, msg)
 
     @property
     def all_ranks(self):
-        return range(len(self.all_processes))
+        return range(self.backend.world_size)
 
     def shutdown(self):
         self._shutdown = True
         self.send(self.all_ranks, messages.Exit())
-        while len(self.exited) < len(self.all_processes):
-            proc, msg = self.ctx.recv()
-            self.handle_message(proc.rank, msg)
+        while len(self.exited) < self.backend.world_size:
+            rank, msg = self.backend.recv(timeout=None)
+            self.handle_message(rank, msg)
 
     def ref(self) -> int:
         return next(self.next_ref)
@@ -132,8 +174,8 @@ class Controller:
         #       not happened. We could do better if tensors/collectives had an invalid bit
         #       that we propagate. In real uses fetches might lag behind anyway so we would not
         #       have to send out so many requests for current status.
-        for sender, value in self.ctx.recvready(timeout):
-            self.handle_message(sender.rank, value)
+        for rank, value in self.backend.recvready(timeout):
+            self.handle_message(rank, value)
 
     def handle_message(self, sender, value):
         getattr(self, value.__class__.__name__)(sender, *value)

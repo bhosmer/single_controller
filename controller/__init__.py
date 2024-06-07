@@ -10,7 +10,7 @@ from .future import Future
 from .tensor import Tensor, dtensor_check
 from .device_mesh import DeviceMesh, remote_function, active_mesh
 from . import stream, device_mesh
-from .controller import Controller as _Controller
+from .controller import Controller as _Controller, ProcessBackend as _ProcessBackend
 
 def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: Optional[str] = None):
     """
@@ -50,8 +50,9 @@ class Pipe:
         raise NotImplementedError()
 
 def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
-    ctrl = _Controller(ctx, hosts, gpu_per_host, _processes=_processes)
-    return DeviceMesh(ctrl, list(ctrl.all_ranks), {'host': len(ctrl.all_processes) // gpu_per_host, 'gpu': gpu_per_host})
+    backend = _ProcessBackend(ctx, hosts, gpu_per_host, _processes=_processes)
+    ctrl = _Controller(backend)
+    return DeviceMesh(ctrl, list(ctrl.all_ranks), {'host': len(hosts), 'gpu': gpu_per_host})
 
 def get_active_stream():
     return stream._active
