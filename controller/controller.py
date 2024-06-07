@@ -1,5 +1,5 @@
 from supervisor import Context, Host, FunctionCall, TTL
-from typing import Dict, Optional, List, Sequence, NamedTuple
+from typing import Dict, Optional, List, Sequence, NamedTuple, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -17,6 +17,7 @@ import itertools
 import socket
 import traceback
 from weakref import WeakKeyDictionary
+from abc import ABC, abstractmethod
 
 check_correctness_per_operator = False
 if check_correctness_per_operator:
@@ -35,6 +36,15 @@ else:
     fake_mode = FakeTensorMode()
 
 _CONTROLLER_STATUS_INTERVAL = 2
+
+class Messaging(ABC):
+    @abstractmethod
+    def send(self, ranks: Sequence[int], msg) -> None:
+        raise NotImplementedError()
+    
+    @abstractmethod
+    def recvready(self, timeout: Optional[float]) -> Sequence[Tuple[int, NamedTuple]]:
+        raise NotImplementedError()
 
 class Controller:
     def __init__(self, ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None, _store=None):
@@ -94,7 +104,8 @@ class Controller:
         self._shutdown = True
         self.send(self.all_ranks, messages.Exit())
         while len(self.exited) < len(self.all_processes):
-            self.handle_message(self.ctx.recv())
+            proc, msg = self.ctx.recv()
+            self.handle_message(proc.rank, msg)
 
     def ref(self) -> int:
         return next(self.next_ref)
@@ -121,11 +132,10 @@ class Controller:
         #       not happened. We could do better if tensors/collectives had an invalid bit
         #       that we propagate. In real uses fetches might lag behind anyway so we would not
         #       have to send out so many requests for current status.
-        for msg in self.ctx.recvready(timeout):
-            self.handle_message(msg)
+        for sender, value in self.ctx.recvready(timeout):
+            self.handle_message(sender.rank, value)
 
-    def handle_message(self, msg):
-        sender, value = msg
+    def handle_message(self, sender, value):
         getattr(self, value.__class__.__name__)(sender, *value)
 
     def ProcessExited(self, proc, result):
@@ -142,7 +152,7 @@ class Controller:
 
     def RemoteFunctionFailed(self, proc, failing_ident, exception: Exception, worker_frames: List[traceback.FrameSummary]):
         self.history.propagate_failure(failing_ident, exception, worker_frames)
-        self.history.rank_completed(proc.rank, failing_ident)
+        self.history.rank_completed(proc, failing_ident)
 
     def Status(self, proc, first_uncompleted_ident):
-        self.history.rank_completed(proc.rank, first_uncompleted_ident)
+        self.history.rank_completed(proc, first_uncompleted_ident)
