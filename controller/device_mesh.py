@@ -96,7 +96,7 @@ class DeviceMesh(Referenceable):
 
     def _process(self, coordinates: Optional[Dict[str, int]]):
         if coordinates is None:
-            return 0
+            return self.processes[0]
         stride = 1
         offset = 0
         extra = set(coordinates.keys()) - set(self.dims.keys())
@@ -110,7 +110,7 @@ class DeviceMesh(Referenceable):
                 raise IndexError(f'{dim} of size {size} has index {idx} out of range')
             offset += stride*idx
             stride *= size
-        return offset
+        return self.processes[offset]
 
     def _use(self, tensor):
         borrows = tensor._borrows

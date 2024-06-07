@@ -117,7 +117,7 @@ class Controller:
         # we also have to make sure if we have deletes to other device meshes,
         # they get processed before we do an op that will try to allocate memory
         for k, v in self.pending_del.items():
-            k._send(messages.DeleteRefs(v))
+            k._send(messages.DeleteRefs(v), flush_deletes=False)
         self.pending_del.clear()
         return to_delete
 
